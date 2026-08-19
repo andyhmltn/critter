@@ -22,6 +22,10 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
+mod progress;
+
+use progress::ReviewProgress;
+
 const ACCENT: Color = Color::Cyan;
 const ADDED: Color = Color::Green;
 const ADDED_BACKGROUND: Color = Color::Rgb(34, 48, 34);
@@ -327,6 +331,7 @@ struct App {
     sidebar_visible: bool,
     files_state: ListState,
     search_query: String,
+    progress: ReviewProgress,
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -839,10 +844,21 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
                     .iter()
                     .filter(|comment| comment.path == file.path)
                     .count();
-                let label = if marked == 0 {
-                    compact_path(&file.path, file_label_width)
+                let viewed = if app.progress.is_viewed(&file.path) {
+                    "✓ "
                 } else {
-                    format!("{}  [{marked}]", compact_path(&file.path, file_label_width))
+                    "  "
+                };
+                let label = if marked == 0 {
+                    format!(
+                        "{viewed}{}",
+                        compact_path(&file.path, file_label_width.saturating_sub(2))
+                    )
+                } else {
+                    format!(
+                        "{viewed}{}  [{marked}]",
+                        compact_path(&file.path, file_label_width.saturating_sub(2))
+                    )
                 };
                 ListItem::new(label)
             })
@@ -943,10 +959,10 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     frame.render_widget(diff, diff_area);
     let status = match &app.mode {
         Mode::Browse if app.sidebar_visible => {
-            "j/k move  Ctrl-d/u page  Enter open/comment  Esc files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
+            "j/k move  Ctrl-d/u page  Enter open/comment  v viewed  Esc files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
         }
         Mode::Browse => {
-            "j/k move  Ctrl-d/u page  Esc show files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
+            "j/k move  Ctrl-d/u page  v viewed  Esc show files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
         }
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Compose => "Enter save  Ctrl+Enter newline  Esc normal  Esc again cancel",
@@ -964,8 +980,10 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     };
     frame.render_widget(
         Paragraph::new(format!(
-            " {status}{search_status}    {} pending",
-            app.comments.len()
+            " {status}{search_status}    {} pending  {}/{} viewed",
+            app.comments.len(),
+            app.progress.viewed_count(),
+            app.files.len()
         ))
         .style(Style::default().fg(MUTED)),
         layout[2],
@@ -1333,6 +1351,12 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
             search(app, false);
         }
         KeyCode::Char('d') => app.mode = Mode::Description,
+        KeyCode::Char('v') => {
+            let path = selected_file(app).path.clone();
+            if let Err(error) = app.progress.toggle(&path) {
+                app.mode = Mode::Message(error.to_string());
+            }
+        }
         KeyCode::Char('c') => {
             app.comment_index = app.comments.len().saturating_sub(1);
             app.mode = Mode::Comments;
@@ -1485,6 +1509,7 @@ fn run(pr_number: String, repo: String) -> Result<()> {
         .remove("base16-ocean.dark")
         .context("could not load default syntax theme")?;
     highlight_files(&mut files, &syntax_set, &syntax_theme);
+    let progress = ReviewProgress::load(&repo, &pr_number, &pull.head_ref_oid)?;
     let mut app = App {
         pr_number,
         repo,
@@ -1502,6 +1527,7 @@ fn run(pr_number: String, repo: String) -> Result<()> {
         sidebar_visible: true,
         files_state: ListState::default(),
         search_query: String::new(),
+        progress,
     };
     app.files_state.select(Some(0));
     let workspace = tempfile::tempdir().context("could not create editor workspace")?;
@@ -1545,8 +1571,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Author, Color, Focus, LineKind, ListState, Mode, PullRequest, TextEditor,
-        editor_overlay, handle_browse, highlight_files, line_matches, parse_diff, search,
+        App, Author, Color, Focus, LineKind, ListState, Mode, PullRequest, ReviewProgress,
+        TextEditor, editor_overlay, handle_browse, highlight_files, line_matches, parse_diff,
+        search,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -1657,6 +1684,7 @@ mod tests {
             sidebar_visible: true,
             files_state: ListState::default(),
             search_query: "needle".to_string(),
+            progress: ReviewProgress::load("owner/repo", "1", "head").unwrap(),
         };
         assert!(search(&mut app, true));
         assert_eq!((app.file_index, app.line_index), (0, 1));

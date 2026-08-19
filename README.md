@@ -26,6 +26,7 @@ The reviewer opens on the changed-file selector, renders unified diffs with line
 | `Ctrl-d` / `Ctrl-u` | Page down or up in the focused pane |
 | `h` / `l` | Previous or next changed file |
 | `Enter` | Open the selected file from the sidebar, or add an inline comment from a diff |
+| `v` | Mark the current file as viewed (press again to undo) |
 | `Esc` | Return from the diff to the file sidebar |
 | `/` | Search changed lines across files, with incremental highlights in the diff |
 | `n` / `N` | Jump to the next or previous search result |
@@ -46,3 +47,5 @@ The reviewer opens on the changed-file selector, renders unified diffs with line
 ```
 
 Comments are only submitted when an action is chosen from the submit dialog. Quit never posts a review.
+
+Viewed-file progress is saved locally and restored the next time the same pull request is opened. It resets automatically when the pull request head commit changes.
