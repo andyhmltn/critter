@@ -13,10 +13,10 @@ Requires: Rust 1.85+ and an authenticated `gh` CLI. `nvim` is used by default wh
 ## Use
 
 ```sh
-reviewer 447 dlvhdr/gh-dash
+reviewer
 ```
 
-The reviewer opens on the changed-file selector, renders unified diffs with line numbers and syntax-aware code colors, and batches inline comments into one GitHub review.
+The reviewer uses the repository in the current directory and opens with a picker for its open pull requests. Pass a PR number (for example, `reviewer 447`) to skip the picker. After choosing a PR, it opens on the changed-file selector, renders unified diffs with line numbers and syntax-aware code colors, and batches inline comments into one GitHub review.
 
 ## Keys
 
@@ -35,6 +35,7 @@ The reviewer opens on the changed-file selector, renders unified diffs with line
 | `o` | Open the selected head-version file at the selected line in `$EDITOR` |
 | `c` | Show and remove pending comments |
 | `s` | Submit as approve, request changes, or comment, with an optional summary |
+| `b` | Return to the pull-request picker |
 | `q` | Quit without submitting |
 
 ## gh-dash keybinding
@@ -42,7 +43,7 @@ The reviewer opens on the changed-file selector, renders unified diffs with line
 ```yaml
 - key: R
   name: review
-  command: reviewer {{.PrNumber}} {{.RepoName}}
+  command: reviewer {{.PrNumber}}
 ```
 
 Comments are only submitted when an action is chosen from the submit dialog. Quit never posts a review.

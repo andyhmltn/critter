@@ -22,6 +22,12 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
+mod progress;
+
+use progress::ReviewProgress;
+
+type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
 const ACCENT: Color = Color::Cyan;
 const ADDED: Color = Color::Green;
 const ADDED_BACKGROUND: Color = Color::Rgb(34, 48, 34);
@@ -44,8 +50,11 @@ struct PullRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CurrentPullRequest {
+struct PullRequestChoice {
     number: u64,
+    title: String,
+    author: Author,
+    head_ref_name: String,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +332,7 @@ struct App {
     comments: Vec<PendingComment>,
     comment_index: usize,
     should_quit: bool,
+    return_to_picker: bool,
     should_redraw: bool,
     sidebar_visible: bool,
     files_state: ListState,
@@ -341,16 +351,112 @@ fn gh(args: &[&str]) -> Result<String> {
     }
 }
 
-fn current_pr_target() -> Result<(String, String)> {
-    let pull_output = gh(&["pr", "view", "--json", "number"])
-        .context("could not find a pull request for the current branch")?;
-    let pull: CurrentPullRequest =
-        serde_json::from_str(&pull_output).context("could not parse the current pull request")?;
+fn current_repo() -> Result<String> {
     let repo_output = gh(&["repo", "view", "--json", "nameWithOwner"])
         .context("could not determine the current repository")?;
     let repo: Repository =
         serde_json::from_str(&repo_output).context("could not parse the current repository")?;
-    Ok((pull.number.to_string(), repo.name_with_owner))
+    Ok(repo.name_with_owner)
+}
+
+fn open_pull_requests(repo: &str) -> Result<Vec<PullRequestChoice>> {
+    let output = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,author,headRefName",
+    ])
+    .context("could not list pull requests")?;
+    serde_json::from_str(&output).context("could not parse pull request list")
+}
+
+fn draw_pr_picker(
+    frame: &mut ratatui::Frame,
+    repo: &str,
+    pulls: &[PullRequestChoice],
+    state: &mut ListState,
+) {
+    let area = frame.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(" Choose a pull request in {repo} "))
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL)),
+        layout[0],
+    );
+    let items = pulls.iter().map(|pull| {
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("#{:<6}", pull.number), Style::default().fg(ACCENT)),
+            Span::raw(&pull.title),
+            Span::styled(
+                format!("  @{}  {}", pull.author.login, pull.head_ref_name),
+                Style::default().fg(MUTED),
+            ),
+        ]))
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Open pull requests ")
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    frame.render_stateful_widget(list, layout[1], state);
+    frame.render_widget(
+        Paragraph::new(" j/k or ↑/↓ select  Enter open  q/Esc quit")
+            .style(Style::default().fg(MUTED)),
+        layout[2],
+    );
+}
+
+fn pick_pull_request(
+    terminal: &mut AppTerminal,
+    repo: &str,
+    pulls: &[PullRequestChoice],
+    initially_selected: usize,
+) -> Result<Option<(String, usize)>> {
+    let mut selected = initially_selected.min(pulls.len() - 1);
+    let mut state = ListState::default().with_selected(Some(selected));
+    loop {
+        terminal.draw(|frame| draw_pr_picker(frame, repo, &pulls, &mut state))?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == event::KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    selected = (selected + 1).min(pulls.len() - 1);
+                    state.select(Some(selected));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    state.select(Some(selected));
+                }
+                KeyCode::Enter => {
+                    return Ok(Some((pulls[selected].number.to_string(), selected)));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn git_at(path: &Path, args: &[&str]) -> Result<String> {
@@ -943,10 +1049,10 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     frame.render_widget(diff, diff_area);
     let status = match &app.mode {
         Mode::Browse if app.sidebar_visible => {
-            "j/k move  Ctrl-d/u page  Enter open/comment  Esc files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
+            "j/k move  Ctrl-d/u page  Enter open/comment  v viewed  Esc files  / search  n/N next/prev  d description  o editor  c pending  s submit  b PRs  q quit"
         }
         Mode::Browse => {
-            "j/k move  Ctrl-d/u page  Esc show files  / search  n/N next/prev  d description  o editor  c pending  s submit  q quit"
+            "j/k move  Ctrl-d/u page  v viewed  Esc show files  / search  n/N next/prev  d description  o editor  c pending  s submit  b PRs  q quit"
         }
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Compose => "Enter save  Ctrl+Enter newline  Esc normal  Esc again cancel",
@@ -1268,6 +1374,7 @@ fn submit(app: &App, event: &str, summary: &str) -> Result<()> {
 fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('b') => app.return_to_picker = true,
         KeyCode::Esc => {
             if !app.sidebar_visible {
                 app.sidebar_visible = true;
@@ -1450,7 +1557,11 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
     }
 }
 
-fn run(pr_number: String, repo: String) -> Result<()> {
+fn review_pull_request(
+    terminal: &mut AppTerminal,
+    pr_number: String,
+    repo: String,
+) -> Result<bool> {
     let pull_json = gh(&[
         "pr",
         "view",
@@ -1498,6 +1609,7 @@ fn run(pr_number: String, repo: String) -> Result<()> {
         comments: Vec::new(),
         comment_index: 0,
         should_quit: false,
+        return_to_picker: false,
         should_redraw: false,
         sidebar_visible: true,
         files_state: ListState::default(),
@@ -1505,14 +1617,13 @@ fn run(pr_number: String, repo: String) -> Result<()> {
     };
     app.files_state.select(Some(0));
     let workspace = tempfile::tempdir().context("could not create editor workspace")?;
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let outcome = loop {
+    loop {
         terminal.draw(|frame| draw(&mut app, frame))?;
         if app.should_quit {
-            break Ok(());
+            return Ok(false);
+        }
+        if app.return_to_picker {
+            return Ok(true);
         }
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
@@ -1524,21 +1635,69 @@ fn run(pr_number: String, repo: String) -> Result<()> {
                 app.should_redraw = false;
             }
         }
-    };
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    outcome
+    }
+}
+
+fn run_in_terminal(
+    repo: String,
+    pulls: Vec<PullRequestChoice>,
+    initial_pr: Option<String>,
+) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let outcome: Result<()> = (|| {
+        let mut selected = 0usize;
+        let mut next_pr = initial_pr;
+        loop {
+            let pr_number = match next_pr.take() {
+                Some(pr_number) => {
+                    if let Some(index) = pulls
+                        .iter()
+                        .position(|pull| pull.number.to_string() == pr_number)
+                    {
+                        selected = index;
+                    }
+                    pr_number
+                }
+                None => match pick_pull_request(&mut terminal, &repo, &pulls, selected)? {
+                    Some((pr_number, index)) => {
+                        selected = index;
+                        pr_number
+                    }
+                    None => return Ok(()),
+                },
+            };
+            if !review_pull_request(&mut terminal, pr_number, repo.clone())? {
+                return Ok(());
+            }
+        }
+    })();
+    let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let raw_mode_result = disable_raw_mode();
+    outcome?;
+    leave_result?;
+    raw_mode_result?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let repo = current_repo()?;
     match args.as_slice() {
         [] => {
-            let (pr_number, repo) = current_pr_target()?;
-            run(pr_number, repo)
+            let pulls = open_pull_requests(&repo)?;
+            if pulls.is_empty() {
+                bail!("No open pull requests found in {repo}.");
+            }
+            run_in_terminal(repo, pulls, None)
         }
-        [pr_number, repo] => run(pr_number.clone(), repo.clone()),
-        _ => bail!("usage: reviewer [<pr-number> <owner/repo>]"),
+        [pr_number] => {
+            let pulls = open_pull_requests(&repo)?;
+            run_in_terminal(repo, pulls, Some(pr_number.clone()))
+        }
+        _ => bail!("usage: reviewer [<pr-number>]"),
     }
 }
 
@@ -1653,6 +1812,7 @@ mod tests {
             comments: Vec::new(),
             comment_index: 0,
             should_quit: false,
+            return_to_picker: false,
             should_redraw: false,
             sidebar_visible: true,
             files_state: ListState::default(),
@@ -1744,11 +1904,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_current_pull_request_target() {
-        let pull: super::CurrentPullRequest = serde_json::from_str(r#"{"number":447}"#).unwrap();
+    fn parses_pull_request_choices_and_current_repo() {
+        let pulls: Vec<super::PullRequestChoice> = serde_json::from_str(
+            r#"[{"number":447,"title":"A focused picker","author":{"login":"octocat"},"headRefName":"picker"}]"#,
+        )
+        .unwrap();
         let repo: super::Repository =
             serde_json::from_str(r#"{"nameWithOwner":"dlvhdr/gh-dash"}"#).unwrap();
-        assert_eq!(pull.number, 447);
+        assert_eq!(pulls[0].number, 447);
+        assert_eq!(pulls[0].title, "A focused picker");
+        assert_eq!(pulls[0].author.login, "octocat");
+        assert_eq!(pulls[0].head_ref_name, "picker");
         assert_eq!(repo.name_with_owner, "dlvhdr/gh-dash");
     }
 }
