@@ -951,7 +951,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Compose => "Enter save  Ctrl+Enter newline  Esc normal  Esc again cancel",
         Mode::Description => "Esc or d to return",
-        Mode::Submit => "a approve  r request changes  c comment  Esc cancel",
+        Mode::Submit => "a approve  r request changes  c comment  Esc cancel  (inline comments optional)",
         Mode::ReviewSummary(_) => "Enter submit  Ctrl+Enter newline  Esc normal  Esc again cancel",
         Mode::Comments => "j/k select  x remove  Esc or c close",
         Mode::Message(_) => "Enter or Esc close",
@@ -1337,13 +1337,7 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
             app.comment_index = app.comments.len().saturating_sub(1);
             app.mode = Mode::Comments;
         }
-        KeyCode::Char('s') => {
-            if app.comments.is_empty() {
-                app.mode = Mode::Message("Add at least one comment before submitting.".to_string())
-            } else {
-                app.mode = Mode::Submit
-            }
-        }
+        KeyCode::Char('s') => app.mode = Mode::Submit,
         KeyCode::Enter => {
             if matches!(app.focus, Focus::Files) {
                 app.sidebar_visible = false;
