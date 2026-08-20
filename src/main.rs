@@ -152,6 +152,7 @@ struct TextEditor {
     cursor: usize,
     mode: EditorMode,
     engine: VimEditor,
+    pending_visual_inner: bool,
 }
 
 enum EditorAction {
@@ -167,6 +168,7 @@ impl TextEditor {
             cursor: 0,
             mode: EditorMode::Insert,
             engine: VimEditor::new_empty(VimModeConfig::default()),
+            pending_visual_inner: false,
         };
         editor.sync_to_engine();
         editor
@@ -177,6 +179,7 @@ impl TextEditor {
         self.cursor = 0;
         self.mode = EditorMode::Insert;
         self.engine = VimEditor::new_empty(VimModeConfig::default());
+        self.pending_visual_inner = false;
         self.sync_to_engine();
     }
 
@@ -223,8 +226,74 @@ impl TextEditor {
         };
     }
 
+    fn select_inner_word(&mut self) {
+        let row = self.engine.cursor_row;
+        let line = &self.engine.lines[row];
+        if line.is_empty() {
+            return;
+        }
+        let cursor = self.engine.cursor_col.min(line.len().saturating_sub(1));
+        let cursor = line
+            .char_indices()
+            .take_while(|(index, _)| *index <= cursor)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(0);
+        let class = |character: char| {
+            if character.is_alphanumeric() || character == '_' {
+                0
+            } else if character.is_whitespace() {
+                1
+            } else {
+                2
+            }
+        };
+        let target_class = class(line[cursor..].chars().next().unwrap_or(' '));
+        let mut start = cursor;
+        while start > 0 {
+            let previous = line[..start]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i);
+            if class(line[previous..].chars().next().unwrap_or(' ')) != target_class {
+                break;
+            }
+            start = previous;
+        }
+        let mut end = cursor;
+        while end < line.len() {
+            let character = line[end..].chars().next().unwrap_or(' ');
+            if class(character) != target_class {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        let last = line[..end]
+            .char_indices()
+            .next_back()
+            .map_or(start, |(index, _)| index);
+        self.engine.visual_anchor = Some((row, start));
+        self.engine.cursor_col = last;
+        self.sync_from_engine();
+    }
+
     fn handle(&mut self, mut key: KeyEvent) -> EditorAction {
         self.sync_to_engine();
+        if matches!(self.engine.mode, VimMode::Visual(VisualKind::Char)) {
+            if self.pending_visual_inner {
+                self.pending_visual_inner = false;
+                if matches!(key.code, KeyCode::Char('w')) {
+                    self.select_inner_word();
+                    return EditorAction::Continue;
+                }
+            }
+            if matches!(key.code, KeyCode::Char('i')) {
+                self.pending_visual_inner = true;
+                return EditorAction::Continue;
+            }
+        } else {
+            self.pending_visual_inner = false;
+        }
         if matches!(self.mode, EditorMode::Insert) && matches!(key.code, KeyCode::Enter) {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 key.modifiers.remove(KeyModifiers::CONTROL);
@@ -292,6 +361,7 @@ struct App {
     description_expanded: bool,
     description_scroll: u16,
     diff_scroll: usize,
+    diff_view_height: usize,
     center_diff: bool,
     pending_z: bool,
     files_state: ListState,
@@ -442,20 +512,22 @@ fn draw_pr_picker(frame: &mut ratatui::Frame, view: PullPickerView<'_>) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(layout[1]);
     let search_marker = if searching { "› " } else { "  " };
+    let mut search_text = editor_render_text_with_prefix(editor, search_marker);
+    if let Some(line) = search_text.lines.first_mut() {
+        if let Some(marker) = line.spans.first_mut() {
+            marker.style = Style::default().fg(ACCENT);
+        }
+        line.spans.push(Span::styled(
+            if searching {
+                format!("  [{}]", editor_status_label(editor))
+            } else {
+                String::new()
+            },
+            Style::default().fg(MUTED),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(search_marker, Style::default().fg(ACCENT)),
-            Span::raw(&editor.text),
-            Span::styled(
-                if searching {
-                    format!("  [{}]", editor_status_label(editor))
-                } else {
-                    String::new()
-                },
-                Style::default().fg(MUTED),
-            ),
-        ]))
-        .block(
+        Paragraph::new(search_text).block(
             Block::default()
                 .title(" Search ")
                 .borders(Borders::ALL)
@@ -845,6 +917,27 @@ fn move_line_in_block(app: &mut App, amount: isize) {
         .clamp(start, end);
 }
 
+fn scroll_oversized_block(app: &mut App, amount: isize) -> bool {
+    let Some((start, end)) = change_block_at(selected_file(app), app.line_index) else {
+        return false;
+    };
+    if end - start < app.diff_view_height.max(1) {
+        return false;
+    }
+    let page = (app.diff_view_height / 2).max(1) as isize;
+    let max_scroll = end.min(
+        selected_file(app)
+            .lines
+            .len()
+            .saturating_sub(app.diff_view_height),
+    );
+    app.diff_scroll = app
+        .diff_scroll
+        .saturating_add_signed(amount.saturating_mul(page))
+        .clamp(start, max_scroll.max(start));
+    true
+}
+
 fn change_file(app: &mut App, amount: isize) {
     if app.files.is_empty() {
         return;
@@ -1023,7 +1116,10 @@ fn editor_render_text(editor: &TextEditor) -> Text<'static> {
     } else {
         (cursor, anchor)
     };
-    let selection_style = Style::default().bg(Color::DarkGray);
+    let selection_style = Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(55, 70, 90))
+        .add_modifier(Modifier::BOLD);
     let lines = editor
         .engine
         .lines
@@ -1061,6 +1157,14 @@ fn editor_render_text(editor: &TextEditor) -> Text<'static> {
         })
         .collect::<Vec<_>>();
     Text::from(lines)
+}
+
+fn editor_render_text_with_prefix(editor: &TextEditor, prefix: &str) -> Text<'static> {
+    let mut text = editor_render_text(editor);
+    if let Some(line) = text.lines.first_mut() {
+        line.spans.insert(0, Span::raw(prefix.to_string()));
+    }
+    text
 }
 
 fn place_editor_cursor(frame: &mut ratatui::Frame, overlay: Rect, editor: &TextEditor) {
@@ -1205,6 +1309,42 @@ fn highlight_files(files: &mut [ChangedFile], syntax_set: &SyntaxSet, syntax_the
     }
 }
 
+fn update_diff_scroll(app: &mut App, visible_height: usize) {
+    app.diff_view_height = visible_height;
+    let max_start = selected_file(app)
+        .lines
+        .len()
+        .saturating_sub(visible_height);
+    if app.center_diff {
+        let center_index = if matches!(app.diff_navigation, DiffNavigation::Block) {
+            change_block_at(selected_file(app), app.line_index)
+                .map_or(app.line_index, |(start, end)| start + (end - start) / 2)
+        } else {
+            app.line_index
+        };
+        app.diff_scroll = center_index
+            .saturating_sub(visible_height / 2)
+            .min(max_start);
+        app.center_diff = false;
+    } else if matches!(app.diff_navigation, DiffNavigation::Block) {
+        if let Some((block_start, block_end)) = change_block_at(selected_file(app), app.line_index)
+        {
+            if block_end < app.diff_scroll {
+                app.diff_scroll = block_start;
+            } else if block_start >= app.diff_scroll.saturating_add(visible_height) {
+                app.diff_scroll = block_start.saturating_sub(visible_height.saturating_sub(1));
+            }
+        }
+    } else if app.line_index < app.diff_scroll {
+        app.diff_scroll = app.line_index;
+    } else if app.line_index >= app.diff_scroll.saturating_add(visible_height) {
+        app.diff_scroll = app
+            .line_index
+            .saturating_sub(visible_height.saturating_sub(1));
+    }
+    app.diff_scroll = app.diff_scroll.min(max_start);
+}
+
 fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     let area = frame.area();
     let layout = Layout::default()
@@ -1322,29 +1462,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         layout[1]
     };
     let visible_height = diff_area.height.saturating_sub(2) as usize;
-    let max_start = selected_file(app)
-        .lines
-        .len()
-        .saturating_sub(visible_height);
-    if app.center_diff {
-        let center_index = if matches!(app.diff_navigation, DiffNavigation::Block) {
-            change_block_at(selected_file(app), app.line_index)
-                .map_or(app.line_index, |(start, end)| start + (end - start) / 2)
-        } else {
-            app.line_index
-        };
-        app.diff_scroll = center_index
-            .saturating_sub(visible_height / 2)
-            .min(max_start);
-        app.center_diff = false;
-    } else if app.line_index < app.diff_scroll {
-        app.diff_scroll = app.line_index;
-    } else if app.line_index >= app.diff_scroll.saturating_add(visible_height) {
-        app.diff_scroll = app
-            .line_index
-            .saturating_sub(visible_height.saturating_sub(1));
-    }
-    app.diff_scroll = app.diff_scroll.min(max_start);
+    update_diff_scroll(app, visible_height);
     let start = app.diff_scroll;
     let file = selected_file(app);
     let search_query = active_search_query(app).to_string();
@@ -1535,7 +1653,7 @@ fn draw_overlay(app: &App, frame: &mut ratatui::Frame, area: Rect) {
         Mode::Command => {
             frame.render_widget(Clear, overlay);
             frame.render_widget(
-                Paragraph::new(format!(":{}", app.editor.text))
+                Paragraph::new(editor_render_text_with_prefix(&app.editor, ":"))
                     .block(
                         Block::default()
                             .title(format!(" Command [{}] ", editor_status_label(&app.editor)))
@@ -1890,7 +2008,7 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
                 move_file(app, page_size(app));
             } else if matches!(app.diff_navigation, DiffNavigation::Line) {
                 move_line_in_block(app, page_size(app));
-            } else {
+            } else if !scroll_oversized_block(app, 1) {
                 move_change_block(app, page_size(app));
             }
         }
@@ -1901,7 +2019,7 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
                 move_file(app, -page_size(app));
             } else if matches!(app.diff_navigation, DiffNavigation::Line) {
                 move_line_in_block(app, -page_size(app));
-            } else {
+            } else if !scroll_oversized_block(app, -1) {
                 move_change_block(app, -page_size(app));
             }
         }
@@ -2169,6 +2287,7 @@ fn review_pull_request(
         description_expanded: false,
         description_scroll: 0,
         diff_scroll: 0,
+        diff_view_height: 0,
         center_diff: true,
         pending_z: false,
         files_state: ListState::default(),
@@ -2315,7 +2434,7 @@ mod tests {
         PullRequest, ReviewProgress, Side, TextEditor, active_author_prefix, author_suggestions,
         change_block_at, complete_author, editor_overlay, editor_render_text, editor_status_label,
         handle_browse, handle_event, highlight_files, line_matches, parse_cli_args, parse_diff,
-        search,
+        search, update_diff_scroll,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2397,7 +2516,7 @@ mod tests {
     #[test]
     fn search_moves_between_matches_in_both_directions() {
         let files = parse_diff(
-            "diff --git a/one.rs b/one.rs\n@@ -1 +1,2 @@\n+needle first\n+companion line\ndiff --git a/two.rs b/two.rs\n@@ -1 +1 @@\n+needle second\n",
+            "diff --git a/one.rs b/one.rs\n@@ -1 +1,5 @@\n+needle first\n+companion one\n+companion two\n+companion three\n+companion four\ndiff --git a/two.rs b/two.rs\n@@ -1 +1 @@\n+needle second\n",
         );
         let mut app = App {
             pr_number: "1".to_string(),
@@ -2429,6 +2548,7 @@ mod tests {
             description_expanded: false,
             description_scroll: 0,
             diff_scroll: 0,
+            diff_view_height: 0,
             center_diff: true,
             pending_z: false,
             files_state: ListState::default(),
@@ -2535,6 +2655,20 @@ mod tests {
             );
         }
         assert!(app.center_diff);
+
+        app.file_index = 0;
+        app.line_index = 1;
+        app.diff_scroll = 0;
+        update_diff_scroll(&mut app, 2);
+        assert_eq!(app.diff_scroll, 2);
+        update_diff_scroll(&mut app, 2);
+        assert_eq!(app.diff_scroll, 2);
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Path::new("."),
+        );
+        assert_eq!(app.diff_scroll, 3);
 
         app.focus = Focus::Files;
         app.sidebar_visible = true;
@@ -2749,24 +2883,24 @@ mod tests {
         editor.handle(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         assert_eq!(editor.cursor, "one two three ".len());
 
-        editor.text = "abc".to_string();
-        editor.cursor = 0;
+        editor.text = "alpha target omega".to_string();
+        editor.cursor = "alpha tar".len();
         editor.mode = super::EditorMode::Normal;
-        for key in ['v', 'l'] {
+        for key in ['v', 'i', 'w'] {
             editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         let rendered = editor_render_text(&editor);
-        assert!(
-            rendered.lines[0]
-                .spans
-                .iter()
-                .any(|span| span.style.bg.is_some())
-        );
+        let selection = rendered.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.bg.is_some())
+            .expect("visual selection is highlighted");
+        assert_eq!(selection.content.as_ref(), "target");
 
         for key in ['c', 'x'] {
             editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
-        assert_eq!(editor.text, "xc");
+        assert_eq!(editor.text, "alpha x omega");
     }
 
     #[test]

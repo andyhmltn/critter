@@ -39,7 +39,7 @@ Typing `author:` offers repository contributors and authors from the loaded PRs.
 
 ## Reviewing diffs
 
-Diff navigation starts in block mode. `j` and `k` jump between contiguous change blocks, which are marked by a cyan rail. `Enter` comments on the block's first line immediately. Use `Shift+Enter` when you want line mode, where `j` and `k` choose a different line and `Enter` starts the comment. `zz` centers the block midpoint, or the selected line in line mode.
+Diff navigation starts in block mode. `j` and `k` jump between contiguous change blocks, which are marked by a cyan rail. `Enter` comments on the block's first line immediately. Use `Shift+Enter` when you want line mode, where `j` and `k` choose a different line and `Enter` starts the comment. `zz` centers the block midpoint, or the selected line in line mode. If one block is taller than the viewport, `Ctrl-d` and `Ctrl-u` scroll through it without changing the active block or comment target.
 
 Inline comments remain local until a review is submitted with `s`. Files can be marked viewed with `v`; that progress is saved locally per repository, PR, and head commit. Changed lines can be searched incrementally with `/`, then revisited with `n` and `N`.
 
