@@ -14,9 +14,11 @@ Requires: Rust 1.85+ and an authenticated `gh` CLI. `nvim` is used by default wh
 
 ```sh
 reviewer
+reviewer --repo owner/name
+reviewer --repo owner/name 447
 ```
 
-The reviewer uses the repository in the current directory and opens with a picker for its open pull requests. Pass a PR number (for example, `reviewer 447`) to skip the picker. After choosing a PR, it opens on the changed-file selector, renders unified diffs with line numbers and syntax-aware code colors, and batches inline comments into one GitHub review.
+By default, the reviewer uses the repository in the current directory. Use `--repo owner/name` (or `-R owner/name`) to browse a GitHub repository without cloning it. Pass a PR number (for example, `reviewer 447` or `reviewer -R owner/name 447`) to skip the picker. After choosing a PR, it opens on the changed-file selector, renders unified diffs with line numbers and syntax-aware code colors, and batches inline comments into one GitHub review.
 
 ## Keys
 

@@ -2228,20 +2228,49 @@ fn run_in_terminal(
     Ok(())
 }
 
+fn parse_cli_args(args: &[String]) -> Result<(Option<String>, Option<String>)> {
+    let mut repo = None;
+    let mut pr_number = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if matches!(argument.as_str(), "--repo" | "-R") {
+            index += 1;
+            let value = args
+                .get(index)
+                .filter(|value| !value.is_empty())
+                .context("--repo requires a repository in owner/name format")?;
+            if repo.replace(value.clone()).is_some() {
+                bail!("--repo may only be supplied once");
+            }
+        } else if let Some(value) = argument.strip_prefix("--repo=") {
+            if value.is_empty() {
+                bail!("--repo requires a repository in owner/name format");
+            }
+            if repo.replace(value.to_string()).is_some() {
+                bail!("--repo may only be supplied once");
+            }
+        } else if argument.starts_with('-') {
+            bail!("unknown option: {argument}");
+        } else if pr_number.replace(argument.clone()).is_some() {
+            bail!("only one pull-request number may be supplied");
+        }
+        index += 1;
+    }
+    Ok((repo, pr_number))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let repo = current_repo()?;
-    match args.as_slice() {
-        [] => {
-            let pulls = open_pull_requests(&repo)?;
-            run_in_terminal(repo, pulls, None)
-        }
-        [pr_number] => {
-            let pulls = open_pull_requests(&repo)?;
-            run_in_terminal(repo, pulls, Some(pr_number.clone()))
-        }
-        _ => bail!("usage: reviewer [<pr-number>]"),
-    }
+    let (repo_override, pr_number) = parse_cli_args(&args).map_err(|error| {
+        anyhow::anyhow!("{error}\nusage: reviewer [--repo <owner/name>] [<pr-number>]")
+    })?;
+    let repo = match repo_override {
+        Some(repo) => repo,
+        None => current_repo()?,
+    };
+    let pulls = open_pull_requests(&repo)?;
+    run_in_terminal(repo, pulls, pr_number)
 }
 
 #[cfg(test)]
@@ -2249,8 +2278,8 @@ mod tests {
     use super::{
         App, Author, Color, DiffNavigation, Focus, LineKind, ListState, Mode, PullRequest,
         ReviewProgress, TextEditor, active_author_prefix, author_suggestions, change_block_at,
-        complete_author, editor_overlay, handle_browse, highlight_files, line_matches, parse_diff,
-        search,
+        complete_author, editor_overlay, handle_browse, highlight_files, line_matches,
+        parse_cli_args, parse_diff, search,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2582,5 +2611,26 @@ mod tests {
         complete_author(&mut editor, "octocat");
         assert_eq!(editor.text, "is:open author:octocat ");
         assert_eq!(editor.cursor, editor.text.len());
+    }
+
+    #[test]
+    fn parses_remote_repository_cli_options_in_either_order() {
+        let args = ["--repo", "octo/repo", "42"].map(str::to_string);
+        assert_eq!(
+            parse_cli_args(&args).unwrap(),
+            (Some("octo/repo".to_string()), Some("42".to_string()))
+        );
+
+        let args = ["42", "-R", "octo/repo"].map(str::to_string);
+        assert_eq!(
+            parse_cli_args(&args).unwrap(),
+            (Some("octo/repo".to_string()), Some("42".to_string()))
+        );
+
+        let args = ["--repo=octo/repo"].map(str::to_string);
+        assert_eq!(
+            parse_cli_args(&args).unwrap(),
+            (Some("octo/repo".to_string()), None)
+        );
     }
 }
