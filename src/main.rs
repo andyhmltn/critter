@@ -25,8 +25,10 @@ use vimltui::{
     EditorAction as VimEditorAction, Operator, VimEditor, VimMode, VimModeConfig, VisualKind,
 };
 
+mod briefing;
 mod progress;
 
+use briefing::BriefingEvent;
 use progress::ReviewProgress;
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -137,6 +139,47 @@ enum Mode {
     ReviewSummary(&'static str),
     Comments,
     Message(String),
+}
+
+enum BriefingState {
+    Idle,
+    Loading {
+        receiver: std::sync::mpsc::Receiver<BriefingEvent>,
+        symbols: Vec<briefing::SymbolChange>,
+        transcript: String,
+    },
+    Chat(String),
+    Failed {
+        error: String,
+        transcript: String,
+    },
+}
+
+enum SectionState {
+    Idle,
+    Loading {
+        receiver: std::sync::mpsc::Receiver<BriefingEvent>,
+        text: String,
+    },
+    Ready(String),
+    Failed(String),
+}
+
+struct ReportSection {
+    title: &'static str,
+    instruction: &'static str,
+    state: SectionState,
+}
+
+fn report_sections() -> Vec<ReportSection> {
+    [
+        ("Overview", "Summarize intent, scope, and the most important reviewer context."),
+        ("Data & contracts", "Identify schema, type, API, serialization, configuration, and compatibility changes."),
+        ("Functions", "Explain important function/signature changes and their callers or consumers."),
+        ("Flow", "Explain behavior and control-flow changes; add one compact ASCII diagram if useful."),
+        ("Tests", "Assess changed tests, uncovered behavior, edge cases, and what the reviewer should verify."),
+        ("Risks & review plan", "Rank concrete risks and give an efficient file/concern review order."),
+    ].into_iter().map(|(title, instruction)| ReportSection { title, instruction, state: SectionState::Idle }).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -367,6 +410,200 @@ struct App {
     files_state: ListState,
     search_query: String,
     progress: ReviewProgress,
+    briefing_open: bool,
+    briefing_state: BriefingState,
+    briefing_scroll: u16,
+    briefing_diff: String,
+    briefing_target: usize,
+    return_to_briefing: bool,
+    report_sections: Vec<ReportSection>,
+    report_section: usize,
+    report_content_focus: bool,
+}
+
+struct ReviewTarget {
+    file_index: usize,
+    line_index: usize,
+    label: String,
+}
+
+fn review_targets(app: &App) -> Vec<ReviewTarget> {
+    let mut targets = Vec::new();
+    for (file_index, file) in app.files.iter().enumerate() {
+        for (line_index, line) in file.lines.iter().enumerate() {
+            if is_change_line(line)
+                && (line_index == 0 || !is_change_line(&file.lines[line_index - 1]))
+            {
+                targets.push(ReviewTarget {
+                    file_index,
+                    line_index,
+                    label: line.text.trim().chars().take(42).collect(),
+                });
+            }
+        }
+    }
+    targets
+}
+
+fn open_briefing_target(app: &mut App) {
+    let targets = review_targets(app);
+    let Some(target) = targets.get(app.briefing_target) else {
+        return;
+    };
+    app.file_index = target.file_index;
+    app.files_state.select(Some(target.file_index));
+    app.line_index = target.line_index;
+    app.sidebar_visible = false;
+    app.focus = Focus::Diff;
+    app.return_to_briefing = true;
+    app.briefing_open = false;
+}
+
+fn local_report_skeleton(app: &App) -> String {
+    let added = app
+        .files
+        .iter()
+        .flat_map(|file| &file.lines)
+        .filter(|line| matches!(line.kind, LineKind::Add))
+        .count();
+    let removed = app
+        .files
+        .iter()
+        .flat_map(|file| &file.lines)
+        .filter(|line| matches!(line.kind, LineKind::Remove))
+        .count();
+    let symbols = briefing::analyze_symbols(&app.briefing_diff);
+    let tests = app
+        .files
+        .iter()
+        .filter(|file| {
+            let path = file.path.to_ascii_lowercase();
+            path.contains("test") || path.contains("spec")
+        })
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    let symbol_lines = if symbols.is_empty() {
+        "No changed top-level signatures detected.".to_string()
+    } else {
+        symbols
+            .iter()
+            .map(|symbol| format!("- {} {} ({})", symbol.kind, symbol.name, symbol.path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let test_lines = if tests.is_empty() {
+        "No test files changed.".to_string()
+    } else {
+        tests.join(", ")
+    };
+    format!(
+        "REVIEW BRIEFING\n\nChange surface\n- {} files, +{} / -{} lines\n- {} → {}\n\nChanged signatures\n{}\n\nTest surface\n{}\n\nPI enrichment (streaming)\n",
+        app.files.len(),
+        added,
+        removed,
+        app.pull.head_ref_name,
+        app.pull.base_ref_name,
+        symbol_lines,
+        test_lines
+    )
+}
+
+fn start_briefing(app: &mut App) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let title = app.pull.title.clone();
+    let body = app.pull.body.clone();
+    let diff = app.briefing_diff.clone();
+    app.briefing_state = BriefingState::Loading {
+        receiver,
+        symbols: briefing::analyze_symbols(&diff),
+        transcript: local_report_skeleton(app),
+    };
+    std::thread::spawn(move || {
+        briefing::generate_stream(
+            "Overview",
+            "Summarize the PR.",
+            &title,
+            &body,
+            &diff,
+            &sender,
+        );
+    });
+}
+
+fn poll_briefing(app: &mut App) {
+    let events = match &app.briefing_state {
+        BriefingState::Loading { receiver, .. } => receiver.try_iter().collect::<Vec<_>>(),
+        _ => return,
+    };
+    for event in events {
+        match event {
+            BriefingEvent::Delta(delta) => {
+                if let BriefingState::Loading { transcript, .. } = &mut app.briefing_state {
+                    transcript.push_str(&delta);
+                }
+            }
+            BriefingEvent::Complete(result) => {
+                let transcript = match &app.briefing_state {
+                    BriefingState::Loading { transcript, .. } => transcript.clone(),
+                    _ => String::new(),
+                };
+                app.briefing_state = match result {
+                    Ok(_) => BriefingState::Chat(transcript),
+                    Err(error) => BriefingState::Failed { error, transcript },
+                };
+            }
+        }
+    }
+}
+
+fn start_report_section(app: &mut App, index: usize) {
+    if !matches!(
+        app.report_sections[index].state,
+        SectionState::Idle | SectionState::Failed(_)
+    ) {
+        return;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let section = app.report_sections[index].title.to_string();
+    let instruction = app.report_sections[index].instruction.to_string();
+    let title = app.pull.title.clone();
+    let body = app.pull.body.clone();
+    let diff = app.briefing_diff.clone();
+    app.report_sections[index].state = SectionState::Loading {
+        receiver,
+        text: String::new(),
+    };
+    std::thread::spawn(move || {
+        briefing::generate_stream(&section, &instruction, &title, &body, &diff, &sender)
+    });
+}
+
+fn poll_report_sections(app: &mut App) {
+    for section in &mut app.report_sections {
+        let events = match &section.state {
+            SectionState::Loading { receiver, .. } => receiver.try_iter().collect::<Vec<_>>(),
+            _ => continue,
+        };
+        for event in events {
+            match event {
+                BriefingEvent::Delta(delta) => {
+                    if let SectionState::Loading { text, .. } = &mut section.state {
+                        text.push_str(&delta);
+                    }
+                }
+                BriefingEvent::Complete(result) => {
+                    let text = match &section.state {
+                        SectionState::Loading { text, .. } => text.clone(),
+                        _ => String::new(),
+                    };
+                    section.state = match result {
+                        Ok(_) => SectionState::Ready(text),
+                        Err(error) => SectionState::Failed(format!("{text}\n{error}")),
+                    };
+                }
+            }
+        }
+    }
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -1346,6 +1583,10 @@ fn update_diff_scroll(app: &mut App, visible_height: usize) {
 }
 
 fn draw(app: &mut App, frame: &mut ratatui::Frame) {
+    if app.briefing_open {
+        draw_briefing(app, frame);
+        return;
+    }
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1579,13 +1820,13 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
             if matches!(app.focus, Focus::Diff)
                 && matches!(app.diff_navigation, DiffNavigation::Line) =>
         {
-            "LINE  j/k line  zz center  Enter comment  Esc blocks  v viewed  / search  : command  c pending  s submit"
+            "LINE  j/k line  zz center  Enter comment  Esc blocks  b briefing  / search  : command  s submit"
         }
         Mode::Browse if app.sidebar_visible => {
-            "BLOCK  j/k change  zz center  Enter comment  Shift-Enter choose line  Esc back  / search  : command  s submit"
+            "BLOCK  j/k change  zz center  Enter comment  Shift-Enter choose line  b briefing  / search  : command  s submit"
         }
         Mode::Browse => {
-            "BLOCK  j/k change  zz center  Enter comment  Shift-Enter choose line  Esc back  / search  : command  s submit"
+            "BLOCK  j/k change  zz center  Enter comment  Shift-Enter choose line  b briefing  / search  : command  s submit"
         }
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Command => "Enter run  Esc normal  Esc again cancel",
@@ -1612,6 +1853,364 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         layout[2],
     );
     draw_overlay(app, frame, area);
+}
+
+fn markdown_inline(mut source: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    while !source.is_empty() {
+        if let Some(rest) = source.strip_prefix('`')
+            && let Some(end) = rest.find('`')
+        {
+            spans.push(Span::styled(
+                rest[..end].to_string(),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .bg(Color::Rgb(35, 35, 42)),
+            ));
+            source = &rest[end + 1..];
+            continue;
+        }
+        if let Some(rest) = source.strip_prefix("**")
+            && let Some(end) = rest.find("**")
+        {
+            spans.push(Span::styled(
+                rest[..end].to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            source = &rest[end + 2..];
+            continue;
+        }
+        let next = [source.find('`'), source.find("**")]
+            .into_iter()
+            .flatten()
+            .filter(|index| *index > 0)
+            .min()
+            .unwrap_or(source.len());
+        spans.push(Span::raw(source[..next].to_string()));
+        source = &source[next..];
+    }
+    spans
+}
+
+fn markdown_text(source: &str) -> Text<'static> {
+    let mut code = false;
+    let lines = source
+        .lines()
+        .filter_map(|raw| {
+            if raw.trim_start().starts_with("```") {
+                code = !code;
+                return None;
+            }
+            let trimmed = raw.trim_start();
+            if code {
+                return Some(Line::styled(
+                    raw.to_string(),
+                    Style::default().fg(Color::LightGreen),
+                ));
+            }
+            if let Some(heading) = trimmed
+                .strip_prefix("### ")
+                .or_else(|| trimmed.strip_prefix("## "))
+                .or_else(|| trimmed.strip_prefix("# "))
+            {
+                return Some(Line::styled(
+                    heading.to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if let Some(item) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                let mut spans = vec![Span::styled("• ", Style::default().fg(ACCENT))];
+                spans.extend(markdown_inline(item));
+                return Some(Line::from(spans));
+            }
+            if let Some((number, item)) = trimmed.split_once(". ")
+                && number.chars().all(|character| character.is_ascii_digit())
+            {
+                let mut spans = vec![Span::styled(
+                    format!("{number}. "),
+                    Style::default().fg(ACCENT),
+                )];
+                spans.extend(markdown_inline(item));
+                return Some(Line::from(spans));
+            }
+            Some(Line::from(markdown_inline(raw)))
+        })
+        .collect::<Vec<_>>();
+    Text::from(lines)
+}
+
+fn draw_briefing(app: &mut App, frame: &mut ratatui::Frame) {
+    let area = frame.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " PR BRIEFING ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("#{}  {}", app.pr_number, app.pull.title)),
+            Span::styled("  deterministic + pi", Style::default().fg(MUTED)),
+        ]))
+        .block(Block::default().borders(Borders::ALL)),
+        layout[0],
+    );
+    if !app.report_sections.is_empty() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
+            .split(layout[1]);
+        let items = app.report_sections.iter().map(|section| {
+            let marker = match section.state {
+                SectionState::Idle => "○",
+                SectionState::Loading { .. } => "◌",
+                SectionState::Ready(_) => "●",
+                SectionState::Failed(_) => "!",
+            };
+            ListItem::new(format!("{marker}  {}", section.title))
+        });
+        let mut state = ListState::default().with_selected(Some(app.report_section));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default()
+                        .title(" Briefing sections ")
+                        .borders(Borders::ALL)
+                        .border_style(if app.report_content_focus {
+                            Style::default()
+                        } else {
+                            Style::default().fg(ACCENT)
+                        }),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("› "),
+            columns[0],
+            &mut state,
+        );
+        let section = &app.report_sections[app.report_section];
+        let (status, source) = match &section.state {
+            SectionState::Idle => (
+                "Enter to generate",
+                "This section is generated only when you open it.",
+            ),
+            SectionState::Loading { text, .. } if text.is_empty() => {
+                ("connecting to PI", "Generating this section…")
+            }
+            SectionState::Loading { text, .. } => ("streaming", text.as_str()),
+            SectionState::Ready(text) => ("ready", text.as_str()),
+            SectionState::Failed(error) => ("failed · Enter retries", error.as_str()),
+        };
+        frame.render_widget(
+            Paragraph::new(markdown_text(source))
+                .scroll((app.briefing_scroll, 0))
+                .block(
+                    Block::default()
+                        .title(format!(" {} · {} ", section.title, status))
+                        .borders(Borders::ALL)
+                        .border_style(if app.report_content_focus {
+                            Style::default().fg(ACCENT)
+                        } else {
+                            Style::default()
+                        }),
+                )
+                .wrap(Wrap { trim: false }),
+            columns[1],
+        );
+        frame.render_widget(
+            Paragraph::new(if app.report_content_focus {
+                " CONTENT  j/k scroll  Esc sections  r regenerate"
+            } else {
+                " SECTIONS  j/k select  Enter open/generate  Esc review"
+            })
+            .style(Style::default().fg(MUTED)),
+            layout[2],
+        );
+        return;
+    }
+    match &app.briefing_state {
+        BriefingState::Idle => {
+            let targets = review_targets(app);
+            app.briefing_target = app.briefing_target.min(targets.len().saturating_sub(1));
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+                .split(layout[1]);
+            let items = targets.iter().map(|target| {
+                ListItem::new(format!(
+                    "{}\n  {}",
+                    target.label, app.files[target.file_index].path
+                ))
+            });
+            let mut state = ListState::default()
+                .with_selected((!targets.is_empty()).then_some(app.briefing_target));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(
+                        Block::default()
+                            .title(format!(" Review targets ({}) ", targets.len()))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("› "),
+                columns[0],
+                &mut state,
+            );
+            let (title, preview) = if let Some(target) = targets.get(app.briefing_target) {
+                let file = &app.files[target.file_index];
+                let (block_start, block_end) = change_block_at(file, target.line_index)
+                    .unwrap_or((target.line_index, target.line_index));
+                let start = block_start.saturating_sub(2);
+                let end = (block_end + 2).min(file.lines.len().saturating_sub(1));
+                let lines = file.lines[start..=end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, line)| {
+                        let index = start + offset;
+                        let sign = match line.kind {
+                            LineKind::Add => "+",
+                            LineKind::Remove => "-",
+                            _ => " ",
+                        };
+                        let mut spans =
+                            vec![Span::styled(format!("{sign} "), line_style(line.kind))];
+                        let mut code: Vec<Span> = file.syntax_lines[index]
+                            .iter()
+                            .map(|span| {
+                                Span::styled(span.text.clone(), Style::default().fg(span.color))
+                            })
+                            .collect();
+                        if code.is_empty() {
+                            code.push(Span::raw(line.text.clone()));
+                        }
+                        for span in &mut code {
+                            span.style = match line.kind {
+                                LineKind::Add => span.style.bg(ADDED_BACKGROUND),
+                                LineKind::Remove => span.style.bg(REMOVED_BACKGROUND),
+                                _ => span.style,
+                            };
+                        }
+                        spans.extend(code);
+                        Line::from(spans)
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    format!(" {} · Enter opens diff ", file.path),
+                    Text::from(lines),
+                )
+            } else {
+                (
+                    " No review targets ".to_string(),
+                    Text::from("No changed blocks were found."),
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(preview)
+                    .block(Block::default().title(title).borders(Borders::ALL))
+                    .wrap(Wrap { trim: false }),
+                columns[1],
+            );
+        }
+        BriefingState::Loading {
+            symbols,
+            transcript,
+            ..
+        } => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(0), Constraint::Percentage(100)])
+                .split(layout[1]);
+            let deterministic = if symbols.is_empty() {
+                "No top-level function or type signature changes detected.".to_string()
+            } else {
+                symbols
+                    .iter()
+                    .map(|symbol| {
+                        format!(
+                            "{:<8}  {}\n          {}",
+                            symbol.kind, symbol.name, symbol.path
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            frame.render_widget(
+                Paragraph::new(deterministic)
+                    .block(
+                        Block::default()
+                            .title(" Available now · deterministic ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ADDED)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                columns[0],
+            );
+            let stream = if transcript.is_empty() {
+                "YOU\nBuild me a peer-review briefing for this PR.\n\nPI\nConnecting…"
+            } else {
+                transcript.as_str()
+            };
+            let lines = stream.lines().count() as u16;
+            let height = columns[1].height.saturating_sub(2);
+            frame.render_widget(
+                Paragraph::new(stream)
+                    .scroll((lines.saturating_sub(height), 0))
+                    .block(
+                        Block::default()
+                            .title(" PI · generating report ")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                columns[1],
+            );
+        }
+        BriefingState::Chat(transcript) => frame.render_widget(
+            Paragraph::new(transcript.as_str())
+                .scroll((app.briefing_scroll, 0))
+                .block(
+                    Block::default()
+                        .title(" PI · review briefing ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT)),
+                )
+                .wrap(Wrap { trim: false }),
+            layout[1],
+        ),
+        BriefingState::Failed { error, transcript } => frame.render_widget(
+            Paragraph::new(format!("{transcript}\n{error}\n\nPress r to retry."))
+                .block(
+                    Block::default()
+                        .title(" PI · report failed ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(REMOVED)),
+                )
+                .wrap(Wrap { trim: false }),
+            layout[1],
+        ),
+    }
+    frame.render_widget(
+        Paragraph::new(" j/k scroll  r rebuild report  b/Esc review")
+            .style(Style::default().fg(MUTED)),
+        layout[2],
+    );
 }
 
 fn draw_overlay(app: &App, frame: &mut ratatui::Frame, area: Rect) {
@@ -1939,6 +2538,88 @@ fn request_return_to_picker(app: &mut App) {
 }
 
 fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
+    if app.briefing_open {
+        if !app.report_sections.is_empty() {
+            match key.code {
+                KeyCode::Char('q') => request_quit(app),
+                KeyCode::Esc if app.report_content_focus => {
+                    app.report_content_focus = false;
+                    app.briefing_scroll = 0;
+                }
+                KeyCode::Esc | KeyCode::Char('b') => app.briefing_open = false,
+                KeyCode::Enter if !app.report_content_focus => {
+                    app.report_content_focus = true;
+                    app.briefing_scroll = 0;
+                    start_report_section(app, app.report_section);
+                }
+                KeyCode::Char('r') if app.report_content_focus => {
+                    app.report_sections[app.report_section].state = SectionState::Idle;
+                    start_report_section(app, app.report_section);
+                    app.briefing_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down if !app.report_content_focus => {
+                    app.report_section =
+                        (app.report_section + 1).min(app.report_sections.len() - 1);
+                    app.briefing_scroll = 0;
+                }
+                KeyCode::Char('k') | KeyCode::Up if !app.report_content_focus => {
+                    app.report_section = app.report_section.saturating_sub(1);
+                    app.briefing_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.briefing_scroll = app.briefing_scroll.saturating_add(1)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.briefing_scroll = app.briefing_scroll.saturating_sub(1)
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.briefing_scroll = app.briefing_scroll.saturating_add(8)
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.briefing_scroll = app.briefing_scroll.saturating_sub(8)
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => app.briefing_open = false,
+            KeyCode::Char('p') if !matches!(app.briefing_state, BriefingState::Loading { .. }) => {
+                start_briefing(app)
+            }
+            KeyCode::Enter if matches!(app.briefing_state, BriefingState::Idle) => {
+                open_briefing_target(app)
+            }
+            KeyCode::Char('r') if !matches!(app.briefing_state, BriefingState::Loading { .. }) => {
+                start_briefing(app)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if matches!(app.briefing_state, BriefingState::Idle) {
+                    app.briefing_target =
+                        (app.briefing_target + 1).min(review_targets(app).len().saturating_sub(1));
+                } else {
+                    app.briefing_scroll = app.briefing_scroll.saturating_add(1)
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if matches!(app.briefing_state, BriefingState::Idle) {
+                    app.briefing_target = app.briefing_target.saturating_sub(1);
+                } else {
+                    app.briefing_scroll = app.briefing_scroll.saturating_sub(1)
+                }
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.briefing_scroll = app.briefing_scroll.saturating_add(8)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.briefing_scroll = app.briefing_scroll.saturating_sub(8)
+            }
+            KeyCode::Char('g') => app.briefing_scroll = 0,
+            KeyCode::Char('G') => app.briefing_scroll = u16::MAX,
+            _ => {}
+        }
+        return;
+    }
     if app.pending_z {
         app.pending_z = false;
         if matches!(app.focus, Focus::Diff) && matches!(key.code, KeyCode::Char('z')) {
@@ -1952,6 +2633,9 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
     }
     match key.code {
         KeyCode::Char('q') => request_quit(app),
+        KeyCode::Char('b') => {
+            app.briefing_open = true;
+        }
         KeyCode::Esc => {
             if matches!(app.focus, Focus::Description) && app.description_expanded {
                 app.description_expanded = false;
@@ -1962,6 +2646,9 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
                 && matches!(app.diff_navigation, DiffNavigation::Line)
             {
                 app.diff_navigation = DiffNavigation::Block;
+            } else if matches!(app.focus, Focus::Diff) && app.return_to_briefing {
+                app.return_to_briefing = false;
+                app.briefing_open = true;
             } else if !app.sidebar_visible {
                 app.sidebar_visible = true;
                 app.focus = Focus::Files;
@@ -2293,11 +2980,22 @@ fn review_pull_request(
         files_state: ListState::default(),
         search_query: String::new(),
         progress,
+        briefing_open: false,
+        briefing_state: BriefingState::Idle,
+        briefing_scroll: 0,
+        briefing_diff: diff,
+        briefing_target: 0,
+        return_to_briefing: false,
+        report_sections: report_sections(),
+        report_section: 0,
+        report_content_focus: false,
     };
     app.files_state.select(Some(0));
     move_change_block(&mut app, 0);
     let workspace = tempfile::tempdir().context("could not create editor workspace")?;
     loop {
+        poll_briefing(&mut app);
+        poll_report_sections(&mut app);
         terminal.draw(|frame| draw(&mut app, frame))?;
         if app.should_quit {
             return Ok(false);
@@ -2430,17 +3128,30 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Author, Color, DiffNavigation, Focus, LineKind, ListState, Mode, PendingComment,
-        PullRequest, ReviewProgress, Side, TextEditor, active_author_prefix, author_suggestions,
-        change_block_at, complete_author, editor_overlay, editor_render_text, editor_status_label,
-        handle_browse, handle_event, highlight_files, line_matches, parse_cli_args, parse_diff,
-        search, update_diff_scroll,
+        App, Author, BriefingState, Color, DiffNavigation, Focus, LineKind, ListState, Mode,
+        PendingComment, PullRequest, ReviewProgress, Side, TextEditor, active_author_prefix,
+        author_suggestions, change_block_at, complete_author, editor_overlay, editor_render_text,
+        editor_status_label, handle_browse, handle_event, highlight_files, line_matches,
+        markdown_inline, parse_cli_args, parse_diff, report_sections, search, update_diff_scroll,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
     use std::path::Path;
     use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
+
+    #[test]
+    fn styles_inline_markdown_code_and_bold_text() {
+        let spans = markdown_inline("Call `load_user` with **validated** input");
+        assert_eq!(spans[1].content, "load_user");
+        assert_eq!(spans[1].style.fg, Some(Color::LightCyan));
+        assert!(
+            spans[3]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
 
     #[test]
     fn parses_both_sides_of_a_unified_diff() {
@@ -2554,6 +3265,15 @@ mod tests {
             files_state: ListState::default(),
             search_query: "needle".to_string(),
             progress: ReviewProgress::load("owner/repo", "1", "head").unwrap(),
+            briefing_open: false,
+            briefing_state: BriefingState::Idle,
+            briefing_scroll: 0,
+            briefing_diff: String::new(),
+            briefing_target: 0,
+            return_to_briefing: false,
+            report_sections: report_sections(),
+            report_section: 0,
+            report_content_focus: false,
         };
         assert!(search(&mut app, true));
         assert_eq!((app.file_index, app.line_index), (0, 1));

@@ -20,6 +20,12 @@ reviewer --repo owner/name 447
 
 By default, the reviewer uses the repository in the current directory. Use `--repo owner/name` (or `-R owner/name`) to browse a GitHub repository without cloning it. Pass a PR number (for example, `reviewer 447` or `reviewer -R owner/name 447`) to skip the picker. After choosing a PR, it opens on the changed-file selector, renders unified diffs with line numbers and syntax-aware code colors, and batches inline comments into one GitHub review.
 
+## PR briefing companion
+
+Press `b` from a review to open the briefing. Its sidebar separates Overview, Data & contracts, Functions, Flow, Tests, and Risks & review plan. Use `j`/`k` to select a section and `Enter` to open and lazily generate only that section. Generated Markdown is rendered as styled terminal content while it streams. `Esc` returns to the section list; sections continue independently in the background, so several can generate concurrently.
+
+This feature requires `pi` on `PATH` and a configured OpenRouter provider. Reports use `openrouter/deepseek/deepseek-v4-flash` with reasoning disabled and a compact change digest; tools, extensions, and skills are disabled so PI cannot modify the checkout.
+
 ## Navigation model
 
 The main review flow is hierarchical:
@@ -60,6 +66,7 @@ Inline comments remain local until a review is submitted with `s`. Files can be 
 | `Tab` | Cycle focus through files, PR description, and diff panes |
 | `Ctrl+Enter` | Add a newline while writing a comment |
 | `d` | Focus and expand the PR description in the sidebar |
+| `b` | Toggle the PR briefing companion view |
 | `o` | Open the selected head-version file at the selected line in `$EDITOR` |
 | `c` | Show and remove pending comments |
 | `s` | Submit as approve, request changes, or comment, with an optional summary |
