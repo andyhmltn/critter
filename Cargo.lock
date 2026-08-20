@@ -1219,6 +1219,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "tempfile",
+ "vimltui",
 ]
 
 [[package]]
@@ -1703,6 +1704,18 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vimltui"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48cc621b6d2f9276c687469cf73438a324df987ec53a36fd78a1c8590c432c2e"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "regex",
+ "unicode-width",
+]
 
 [[package]]
 name = "vtparse"
