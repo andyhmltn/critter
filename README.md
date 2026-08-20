@@ -39,6 +39,8 @@ The reviewer uses the repository in the current directory and opens with a picke
 | `b` | Return to the pull-request picker |
 | `q` | Quit without submitting |
 
+In the pull-request picker, press `/` to edit the GitHub search query. Searches default to `is:open` and accept GitHub qualifiers such as `author:`, `label:`, and `review:`. While entering `author:`, use ↑/↓ and `Tab` to select a repository contributor.
+
 ## gh-dash keybinding
 
 ```yaml

@@ -507,13 +507,19 @@ fn current_repo() -> Result<String> {
 }
 
 fn open_pull_requests(repo: &str) -> Result<Vec<PullRequestChoice>> {
+    search_pull_requests(repo, "is:open")
+}
+
+fn search_pull_requests(repo: &str, query: &str) -> Result<Vec<PullRequestChoice>> {
     let output = gh(&[
         "pr",
         "list",
         "--repo",
         repo,
         "--state",
-        "open",
+        "all",
+        "--search",
+        query,
         "--limit",
         "100",
         "--json",
@@ -523,17 +529,91 @@ fn open_pull_requests(repo: &str) -> Result<Vec<PullRequestChoice>> {
     serde_json::from_str(&output).context("could not parse pull request list")
 }
 
-fn draw_pr_picker(
-    frame: &mut ratatui::Frame,
-    repo: &str,
-    pulls: &[PullRequestChoice],
-    state: &mut ListState,
-) {
+fn repository_contributors(repo: &str, pulls: &[PullRequestChoice]) -> Vec<String> {
+    let mut contributors: Vec<String> =
+        pulls.iter().map(|pull| pull.author.login.clone()).collect();
+    if let Ok(output) = gh(&[
+        "api",
+        &format!("repos/{repo}/contributors?per_page=100"),
+        "--paginate",
+        "--jq",
+        ".[] | .login // empty",
+    ]) {
+        contributors.extend(output.lines().map(str::to_string));
+    }
+    contributors.sort_by_key(|login| login.to_lowercase());
+    contributors.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    contributors
+}
+
+fn active_author_prefix(editor: &TextEditor) -> Option<(usize, &str)> {
+    let before_cursor = &editor.text[..editor.cursor];
+    let token_start = before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    before_cursor[token_start..]
+        .strip_prefix("author:")
+        .map(|prefix| (token_start, prefix))
+}
+
+fn author_suggestions<'a>(editor: &TextEditor, contributors: &'a [String]) -> Vec<&'a str> {
+    let Some((_, prefix)) = active_author_prefix(editor) else {
+        return Vec::new();
+    };
+    let prefix = prefix.to_lowercase();
+    contributors
+        .iter()
+        .filter(|login| login.to_lowercase().starts_with(&prefix))
+        .take(5)
+        .map(String::as_str)
+        .collect()
+}
+
+fn complete_author(editor: &mut TextEditor, login: &str) {
+    let Some((token_start, _)) = active_author_prefix(editor) else {
+        return;
+    };
+    editor
+        .text
+        .replace_range(token_start..editor.cursor, &format!("author:{login} "));
+    editor.cursor = token_start + "author:".len() + login.len() + 1;
+}
+
+struct PullPickerView<'a> {
+    repo: &'a str,
+    pulls: &'a [PullRequestChoice],
+    state: &'a mut ListState,
+    editor: &'a TextEditor,
+    searching: bool,
+    suggestions: &'a [&'a str],
+    suggestion_index: usize,
+    error: Option<&'a str>,
+}
+
+fn draw_pr_picker(frame: &mut ratatui::Frame, view: PullPickerView<'_>) {
+    let PullPickerView {
+        repo,
+        pulls,
+        state,
+        editor,
+        searching,
+        suggestions,
+        suggestion_index,
+        error,
+    } = view;
     let area = frame.area();
+    let search_height = 3 + if searching {
+        suggestions.len() as u16
+    } else {
+        0
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(search_height),
             Constraint::Min(3),
             Constraint::Length(2),
         ])
@@ -544,6 +624,49 @@ fn draw_pr_picker(
             .block(Block::default().borders(Borders::ALL)),
         layout[0],
     );
+    let search_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(layout[1]);
+    let search_marker = if searching { "› " } else { "  " };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(search_marker, Style::default().fg(ACCENT)),
+            Span::raw(&editor.text),
+            Span::styled(
+                if searching {
+                    format!("  [{}]", editor_mode_label(editor))
+                } else {
+                    String::new()
+                },
+                Style::default().fg(MUTED),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .title(" Search ")
+                .borders(Borders::ALL)
+                .border_style(if searching {
+                    Style::default().fg(ACCENT)
+                } else {
+                    Style::default()
+                }),
+        ),
+        search_layout[0],
+    );
+    if searching && !suggestions.is_empty() {
+        let items = suggestions.iter().enumerate().map(|(index, login)| {
+            let style = if index == suggestion_index {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("  author:{login}")).style(style)
+        });
+        frame.render_widget(List::new(items), search_layout[1]);
+    }
     let items = pulls.iter().map(|pull| {
         ListItem::new(Line::from(vec![
             Span::styled(format!("#{:<6}", pull.number), Style::default().fg(ACCENT)),
@@ -557,7 +680,7 @@ fn draw_pr_picker(
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Open pull requests ")
+                .title(format!(" Pull requests ({}) ", pulls.len()))
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -566,38 +689,139 @@ fn draw_pr_picker(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
-    frame.render_stateful_widget(list, layout[1], state);
+    frame.render_stateful_widget(list, layout[2], state);
+    let status = if let Some(error) = error {
+        format!(" {error}")
+    } else if searching {
+        " ↑/↓ choose author  Tab complete  Enter search  Esc normal/cancel".to_string()
+    } else {
+        " j/k or ↑/↓ select  Enter open  / search  q/Esc quit".to_string()
+    };
     frame.render_widget(
-        Paragraph::new(" j/k or ↑/↓ select  Enter open  q/Esc quit")
-            .style(Style::default().fg(MUTED)),
-        layout[2],
+        Paragraph::new(status).style(Style::default().fg(if error.is_some() {
+            REMOVED
+        } else {
+            MUTED
+        })),
+        layout[3],
     );
 }
 
 fn pick_pull_request(
     terminal: &mut AppTerminal,
     repo: &str,
-    pulls: &[PullRequestChoice],
+    pulls: &mut Vec<PullRequestChoice>,
+    contributors: &mut Vec<String>,
+    query: &mut String,
     initially_selected: usize,
 ) -> Result<Option<(String, usize)>> {
-    let mut selected = initially_selected.min(pulls.len() - 1);
-    let mut state = ListState::default().with_selected(Some(selected));
+    let mut selected = initially_selected.min(pulls.len().saturating_sub(1));
+    let mut state = ListState::default().with_selected((!pulls.is_empty()).then_some(selected));
+    let mut editor = TextEditor::new();
+    editor.text = query.clone();
+    editor.cursor = editor.text.len();
+    let mut searching = false;
+    let mut suggestion_index = 0usize;
+    let mut error: Option<String> = None;
     loop {
-        terminal.draw(|frame| draw_pr_picker(frame, repo, pulls, &mut state))?;
+        let suggestions = author_suggestions(&editor, contributors);
+        suggestion_index = suggestion_index.min(suggestions.len().saturating_sub(1));
+        terminal.draw(|frame| {
+            draw_pr_picker(
+                frame,
+                PullPickerView {
+                    repo,
+                    pulls,
+                    state: &mut state,
+                    editor: &editor,
+                    searching,
+                    suggestions: &suggestions,
+                    suggestion_index,
+                    error: error.as_deref(),
+                },
+            )
+        })?;
         if let Event::Key(key) = event::read()?
             && key.kind == event::KeyEventKind::Press
         {
+            if searching {
+                error = None;
+                if !suggestions.is_empty() && matches!(key.code, KeyCode::Up) {
+                    suggestion_index = suggestion_index.saturating_sub(1);
+                    continue;
+                }
+                if !suggestions.is_empty() && matches!(key.code, KeyCode::Down) {
+                    suggestion_index = (suggestion_index + 1).min(suggestions.len() - 1);
+                    continue;
+                }
+                if !suggestions.is_empty() && matches!(key.code, KeyCode::Tab) {
+                    let login = suggestions[suggestion_index].to_string();
+                    complete_author(&mut editor, &login);
+                    suggestion_index = 0;
+                    continue;
+                }
+                match editor.handle(key) {
+                    EditorAction::Cancel => {
+                        searching = false;
+                        editor.text = query.clone();
+                        editor.cursor = editor.text.len();
+                        editor.mode = EditorMode::Insert;
+                    }
+                    EditorAction::Submit => {
+                        let submitted = editor.text.trim();
+                        let submitted = if submitted.is_empty() {
+                            "is:open"
+                        } else {
+                            submitted
+                        };
+                        match search_pull_requests(repo, submitted) {
+                            Ok(results) => {
+                                *query = submitted.to_string();
+                                *pulls = results;
+                                contributors
+                                    .extend(pulls.iter().map(|pull| pull.author.login.clone()));
+                                contributors.sort_by_key(|login| login.to_lowercase());
+                                contributors
+                                    .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+                                selected = 0;
+                                state.select((!pulls.is_empty()).then_some(0));
+                                searching = false;
+                                editor.mode = EditorMode::Insert;
+                            }
+                            Err(search_error) => error = Some(search_error.to_string()),
+                        }
+                    }
+                    EditorAction::Continue => {
+                        suggestion_index = 0;
+                    }
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('/') => {
+                    searching = true;
+                    editor.text = if query.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{query} ")
+                    };
+                    editor.cursor = editor.text.len();
+                    editor.mode = EditorMode::Insert;
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    selected = (selected + 1).min(pulls.len() - 1);
-                    state.select(Some(selected));
+                    if !pulls.is_empty() {
+                        selected = (selected + 1).min(pulls.len() - 1);
+                        state.select(Some(selected));
+                    }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    selected = selected.saturating_sub(1);
-                    state.select(Some(selected));
+                    if !pulls.is_empty() {
+                        selected = selected.saturating_sub(1);
+                        state.select(Some(selected));
+                    }
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter if !pulls.is_empty() => {
                     return Ok(Some((pulls[selected].number.to_string(), selected)));
                 }
                 _ => {}
@@ -1942,9 +2166,10 @@ fn review_pull_request(
 
 fn run_in_terminal(
     repo: String,
-    pulls: Vec<PullRequestChoice>,
+    mut pulls: Vec<PullRequestChoice>,
     initial_pr: Option<String>,
 ) -> Result<()> {
+    let mut contributors = repository_contributors(&repo, &pulls);
     let syntax_set = SyntaxSet::load_defaults_newlines();
     let syntax_theme = ThemeSet::load_defaults()
         .themes
@@ -1957,6 +2182,7 @@ fn run_in_terminal(
     let outcome: Result<()> = (|| {
         let mut selected = 0usize;
         let mut next_pr = initial_pr;
+        let mut picker_query = "is:open".to_string();
         loop {
             let pr_number = match next_pr.take() {
                 Some(pr_number) => {
@@ -1968,7 +2194,14 @@ fn run_in_terminal(
                     }
                     pr_number
                 }
-                None => match pick_pull_request(&mut terminal, &repo, &pulls, selected)? {
+                None => match pick_pull_request(
+                    &mut terminal,
+                    &repo,
+                    &mut pulls,
+                    &mut contributors,
+                    &mut picker_query,
+                    selected,
+                )? {
                     Some((pr_number, index)) => {
                         selected = index;
                         pr_number
@@ -2001,9 +2234,6 @@ fn main() -> Result<()> {
     match args.as_slice() {
         [] => {
             let pulls = open_pull_requests(&repo)?;
-            if pulls.is_empty() {
-                bail!("No open pull requests found in {repo}.");
-            }
             run_in_terminal(repo, pulls, None)
         }
         [pr_number] => {
@@ -2018,8 +2248,9 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         App, Author, Color, DiffNavigation, Focus, LineKind, ListState, Mode, PullRequest,
-        ReviewProgress, TextEditor, change_block_at, editor_overlay, handle_browse,
-        highlight_files, line_matches, parse_diff, search,
+        ReviewProgress, TextEditor, active_author_prefix, author_suggestions, change_block_at,
+        complete_author, editor_overlay, handle_browse, highlight_files, line_matches, parse_diff,
+        search,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2336,5 +2567,20 @@ mod tests {
         assert_eq!(pulls[0].author.login, "octocat");
         assert_eq!(pulls[0].head_ref_name, "picker");
         assert_eq!(repo.name_with_owner, "dlvhdr/gh-dash");
+    }
+
+    #[test]
+    fn completes_author_qualifiers_from_contributors() {
+        let mut editor = TextEditor::new();
+        editor.text = "is:open author:oc".to_string();
+        editor.cursor = editor.text.len();
+        let contributors = vec!["alice".to_string(), "octocat".to_string()];
+
+        assert_eq!(active_author_prefix(&editor), Some((8, "oc")));
+        assert_eq!(author_suggestions(&editor, &contributors), vec!["octocat"]);
+
+        complete_author(&mut editor, "octocat");
+        assert_eq!(editor.text, "is:open author:octocat ");
+        assert_eq!(editor.cursor, editor.text.len());
     }
 }
