@@ -118,6 +118,12 @@ enum Focus {
     Diff,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffNavigation {
+    Block,
+    Line,
+}
+
 enum Mode {
     Browse,
     Search { previous_query: String },
@@ -135,10 +141,18 @@ enum EditorMode {
     Normal,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorOperator {
+    Change,
+    Delete,
+}
+
 struct TextEditor {
     text: String,
     cursor: usize,
     mode: EditorMode,
+    pending_operator: Option<EditorOperator>,
+    pending_inner: bool,
 }
 
 enum EditorAction {
@@ -153,6 +167,8 @@ impl TextEditor {
             text: String::new(),
             cursor: 0,
             mode: EditorMode::Insert,
+            pending_operator: None,
+            pending_inner: false,
         }
     }
 
@@ -160,6 +176,8 @@ impl TextEditor {
         self.text.clear();
         self.cursor = 0;
         self.mode = EditorMode::Insert;
+        self.pending_operator = None;
+        self.pending_inner = false;
     }
 
     fn previous_boundary(&self) -> usize {
@@ -234,7 +252,134 @@ impl TextEditor {
         }
     }
 
+    fn change_line(&mut self) {
+        let start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| self.cursor + index);
+        self.text.drain(start..end);
+        self.cursor = start;
+        self.mode = EditorMode::Insert;
+    }
+
+    fn delete_line(&mut self) {
+        let mut start = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let mut end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| self.cursor + index + 1);
+        if end == self.text.len() && start > 0 {
+            start -= 1;
+        }
+        if start == end {
+            end = self.text.len();
+        }
+        self.text.drain(start..end);
+        self.cursor = start.min(self.text.len());
+    }
+
+    fn inner_word_range(&self) -> Option<(usize, usize)> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let anchor = if self.cursor == self.text.len() {
+            self.previous_boundary()
+        } else {
+            self.cursor
+        };
+        let class = |character: char| {
+            if character.is_alphanumeric() || character == '_' {
+                0
+            } else if character.is_whitespace() {
+                1
+            } else {
+                2
+            }
+        };
+        let target_class = class(self.text[anchor..].chars().next()?);
+        let mut start = anchor;
+        while start > 0 {
+            let previous = self.text[..start].char_indices().next_back()?.0;
+            if class(self.text[previous..].chars().next()?) != target_class {
+                break;
+            }
+            start = previous;
+        }
+        let mut end = anchor;
+        while end < self.text.len() {
+            let character = self.text[end..].chars().next()?;
+            if class(character) != target_class {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        Some((start, end))
+    }
+
+    fn apply_range_operator(&mut self, operator: EditorOperator, start: usize, end: usize) {
+        self.text.drain(start..end);
+        self.cursor = start;
+        if matches!(operator, EditorOperator::Change) {
+            self.mode = EditorMode::Insert;
+        }
+    }
+
+    fn apply_word_operator(&mut self, operator: EditorOperator) {
+        let start = self.cursor;
+        self.move_word_forward();
+        let end = self.cursor;
+        self.apply_range_operator(operator, start, end);
+    }
+
     fn handle(&mut self, key: KeyEvent) -> EditorAction {
+        if matches!(self.mode, EditorMode::Normal) {
+            if let Some(operator) = self.pending_operator.take() {
+                if self.pending_inner {
+                    self.pending_inner = false;
+                    if matches!(key.code, KeyCode::Char('w')) {
+                        if let Some((start, end)) = self.inner_word_range() {
+                            self.apply_range_operator(operator, start, end);
+                        }
+                        return EditorAction::Continue;
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Char('i') => {
+                            self.pending_operator = Some(operator);
+                            self.pending_inner = true;
+                            return EditorAction::Continue;
+                        }
+                        KeyCode::Char('w') => {
+                            self.apply_word_operator(operator);
+                            return EditorAction::Continue;
+                        }
+                        KeyCode::Char('c') if matches!(operator, EditorOperator::Change) => {
+                            self.change_line();
+                            return EditorAction::Continue;
+                        }
+                        KeyCode::Char('d') if matches!(operator, EditorOperator::Delete) => {
+                            self.delete_line();
+                            return EditorAction::Continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.pending_operator = Some(EditorOperator::Change);
+                    return EditorAction::Continue;
+                }
+                KeyCode::Char('d') => {
+                    self.pending_operator = Some(EditorOperator::Delete);
+                    return EditorAction::Continue;
+                }
+                _ => {}
+            }
+        }
         match self.mode {
             EditorMode::Insert => match key.code {
                 KeyCode::Esc => {
@@ -327,6 +472,7 @@ struct App {
     file_index: usize,
     line_index: usize,
     focus: Focus,
+    diff_navigation: DiffNavigation,
     mode: Mode,
     editor: TextEditor,
     comments: Vec<PendingComment>,
@@ -337,6 +483,7 @@ struct App {
     sidebar_visible: bool,
     files_state: ListState,
     search_query: String,
+    progress: ReviewProgress,
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -436,7 +583,7 @@ fn pick_pull_request(
     let mut selected = initially_selected.min(pulls.len() - 1);
     let mut state = ListState::default().with_selected(Some(selected));
     loop {
-        terminal.draw(|frame| draw_pr_picker(frame, repo, &pulls, &mut state))?;
+        terminal.draw(|frame| draw_pr_picker(frame, repo, pulls, &mut state))?;
         if let Event::Key(key) = event::read()?
             && key.kind == event::KeyEventKind::Press
         {
@@ -611,12 +758,58 @@ fn selected_file(app: &App) -> &ChangedFile {
     &app.files[app.file_index]
 }
 
-fn move_line(app: &mut App, amount: isize) {
-    let length = selected_file(app).lines.len();
-    if length == 0 {
+fn is_change_line(line: &DiffLine) -> bool {
+    matches!(line.kind, LineKind::Add | LineKind::Remove)
+}
+
+fn change_block_at(file: &ChangedFile, index: usize) -> Option<(usize, usize)> {
+    if !file.lines.get(index).is_some_and(is_change_line) {
+        return None;
+    }
+    let mut start = index;
+    while start > 0 && is_change_line(&file.lines[start - 1]) {
+        start -= 1;
+    }
+    let mut end = index;
+    while end + 1 < file.lines.len() && is_change_line(&file.lines[end + 1]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+fn move_change_block(app: &mut App, amount: isize) {
+    let lines = &selected_file(app).lines;
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| {
+            is_change_line(line) && (*index == 0 || !is_change_line(&lines[index - 1]))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if starts.is_empty() {
         return;
     }
-    app.line_index = app.line_index.saturating_add_signed(amount).min(length - 1);
+    let current = starts
+        .iter()
+        .rposition(|start| *start <= app.line_index)
+        .unwrap_or(0);
+    let target = current.saturating_add_signed(amount).min(starts.len() - 1);
+    app.line_index = starts[target];
+}
+
+fn move_line_in_block(app: &mut App, amount: isize) {
+    let Some((start, end)) = change_block_at(selected_file(app), app.line_index) else {
+        return;
+    };
+    app.line_index = app
+        .line_index
+        .saturating_add_signed(amount)
+        .clamp(start, end);
+}
+
+fn selected_block_has_one_line(app: &App) -> bool {
+    change_block_at(selected_file(app), app.line_index).is_some_and(|(start, end)| start == end)
 }
 
 fn change_file(app: &mut App, amount: isize) {
@@ -628,6 +821,8 @@ fn change_file(app: &mut App, amount: isize) {
         .saturating_add_signed(amount)
         .min(app.files.len() - 1);
     app.line_index = 0;
+    app.diff_navigation = DiffNavigation::Block;
+    move_change_block(app, 0);
     app.files_state.select(Some(app.file_index));
 }
 
@@ -945,10 +1140,21 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
                     .iter()
                     .filter(|comment| comment.path == file.path)
                     .count();
-                let label = if marked == 0 {
-                    compact_path(&file.path, file_label_width)
+                let viewed = if app.progress.is_viewed(&file.path) {
+                    "✓ "
                 } else {
-                    format!("{}  [{marked}]", compact_path(&file.path, file_label_width))
+                    "  "
+                };
+                let label = if marked == 0 {
+                    format!(
+                        "{viewed}{}",
+                        compact_path(&file.path, file_label_width.saturating_sub(2))
+                    )
+                } else {
+                    format!(
+                        "{viewed}{}  [{marked}]",
+                        compact_path(&file.path, file_label_width.saturating_sub(2))
+                    )
                 };
                 ListItem::new(label)
             })
@@ -998,17 +1204,49 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
                 LineKind::Remove => "-",
                 _ => " ",
             };
-            let prefix = if index == app.line_index { "›" } else { " " };
-            let selected = index == app.line_index;
+            let active_range = change_block_at(file, app.line_index);
+            let active_block =
+                active_range.is_some_and(|(start, end)| (start..=end).contains(&index));
+            let selected =
+                matches!(app.diff_navigation, DiffNavigation::Line) && index == app.line_index;
+            let marker = if selected {
+                "▶"
+            } else if let Some((start, end)) = active_range.filter(|_| active_block) {
+                if start == end {
+                    "◆"
+                } else if index == start {
+                    "┏"
+                } else if index == end {
+                    "┗"
+                } else {
+                    "┃"
+                }
+            } else {
+                " "
+            };
             let matched =
                 !normalized_search_query.is_empty() && line_matches(line, &normalized_search_query);
             let mut style = line_style(line.kind);
-            if selected {
-                style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
-            } else if matched {
+            if matched && !active_block {
                 style = style.bg(Color::DarkGray);
             }
-            let mut spans = vec![Span::styled(format!("{prefix}{old} {new} {sign} "), style)];
+            let line_prefix = format!("{old} {new} {sign} ");
+            let marker_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else if active_block {
+                line_style(line.kind)
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            let mut spans = vec![
+                Span::styled(marker, marker_style),
+                Span::styled(line_prefix, style),
+            ];
             let mut syntax_spans: Vec<Span> = file.syntax_lines[index]
                 .iter()
                 .map(|span| Span::styled(span.text.clone(), Style::default().fg(span.color)))
@@ -1017,9 +1255,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
                 syntax_spans.push(Span::raw(line.text.clone()));
             }
             for span in &mut syntax_spans {
-                span.style = if selected {
-                    span.style.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-                } else if matched {
+                span.style = if matched && !active_block {
                     span.style.bg(Color::DarkGray)
                 } else {
                     match line.kind {
@@ -1037,7 +1273,14 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     let diff = Paragraph::new(Text::from(diff_lines))
         .block(
             Block::default()
-                .title(format!(" {} ", file.path))
+                .title(format!(
+                    " {} [{}] ",
+                    file.path,
+                    match app.diff_navigation {
+                        DiffNavigation::Block => "BLOCK",
+                        DiffNavigation::Line => "LINE",
+                    }
+                ))
                 .borders(Borders::ALL)
                 .border_style(if matches!(app.focus, Focus::Diff) {
                     Style::default().fg(ACCENT)
@@ -1048,11 +1291,17 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         .wrap(Wrap { trim: false });
     frame.render_widget(diff, diff_area);
     let status = match &app.mode {
+        Mode::Browse
+            if matches!(app.focus, Focus::Diff)
+                && matches!(app.diff_navigation, DiffNavigation::Line) =>
+        {
+            "LINE  j/k line  Enter comment  Esc blocks  v viewed  / search  o editor  c pending  s submit  q quit"
+        }
         Mode::Browse if app.sidebar_visible => {
-            "j/k move  Ctrl-d/u page  Enter open/comment  v viewed  Esc files  / search  n/N next/prev  d description  o editor  c pending  s submit  b PRs  q quit"
+            "BLOCK  j/k change  Enter lines  Ctrl-d/u page  v viewed  Esc files  / search  d description  c pending  s submit  q quit"
         }
         Mode::Browse => {
-            "j/k move  Ctrl-d/u page  v viewed  Esc show files  / search  n/N next/prev  d description  o editor  c pending  s submit  b PRs  q quit"
+            "BLOCK  j/k change  Enter lines  Ctrl-d/u page  v viewed  Esc show files  / search  d description  c pending  s submit  q quit"
         }
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Compose => "Enter save  Ctrl+Enter newline  Esc normal  Esc again cancel",
@@ -1070,8 +1319,10 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     };
     frame.render_widget(
         Paragraph::new(format!(
-            " {status}{search_status}    {} pending",
-            app.comments.len()
+            " {status}{search_status}    {} pending  {}/{} viewed",
+            app.comments.len(),
+            app.progress.viewed_count(),
+            app.files.len()
         ))
         .style(Style::default().fg(MUTED)),
         layout[2],
@@ -1376,7 +1627,11 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('b') => app.return_to_picker = true,
         KeyCode::Esc => {
-            if !app.sidebar_visible {
+            if matches!(app.focus, Focus::Diff)
+                && matches!(app.diff_navigation, DiffNavigation::Line)
+            {
+                app.diff_navigation = DiffNavigation::Block;
+            } else if !app.sidebar_visible {
                 app.sidebar_visible = true;
                 app.focus = Focus::Files;
             } else if matches!(app.focus, Focus::Diff) {
@@ -1386,38 +1641,59 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
         KeyCode::Char('j') | KeyCode::Down => {
             if matches!(app.focus, Focus::Files) {
                 change_file(app, 1)
+            } else if matches!(app.diff_navigation, DiffNavigation::Line) {
+                move_line_in_block(app, 1)
             } else {
-                move_line(app, 1)
+                move_change_block(app, 1)
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
             if matches!(app.focus, Focus::Files) {
                 change_file(app, -1)
+            } else if matches!(app.diff_navigation, DiffNavigation::Line) {
+                move_line_in_block(app, -1)
             } else {
-                move_line(app, -1)
+                move_change_block(app, -1)
             }
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if matches!(app.focus, Focus::Files) {
                 move_file(app, page_size(app));
+            } else if matches!(app.diff_navigation, DiffNavigation::Line) {
+                move_line_in_block(app, page_size(app));
             } else {
-                move_line(app, page_size(app));
+                move_change_block(app, page_size(app));
             }
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if matches!(app.focus, Focus::Files) {
                 move_file(app, -page_size(app));
+            } else if matches!(app.diff_navigation, DiffNavigation::Line) {
+                move_line_in_block(app, -page_size(app));
             } else {
-                move_line(app, -page_size(app));
+                move_change_block(app, -page_size(app));
             }
         }
         KeyCode::Char('h') | KeyCode::Left => change_file(app, -1),
         KeyCode::Char('l') | KeyCode::Right => change_file(app, 1),
         KeyCode::Char('g') => {
-            app.line_index = 0;
+            if matches!(app.diff_navigation, DiffNavigation::Line) {
+                if let Some((start, _)) = change_block_at(selected_file(app), app.line_index) {
+                    app.line_index = start;
+                }
+            } else {
+                app.line_index = 0;
+                move_change_block(app, 0);
+            }
         }
         KeyCode::Char('G') => {
-            app.line_index = selected_file(app).lines.len().saturating_sub(1);
+            if matches!(app.diff_navigation, DiffNavigation::Line) {
+                if let Some((_, end)) = change_block_at(selected_file(app), app.line_index) {
+                    app.line_index = end;
+                }
+            } else {
+                move_change_block(app, isize::MAX);
+            }
         }
         KeyCode::Tab => {
             if app.sidebar_visible {
@@ -1440,6 +1716,12 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
             search(app, false);
         }
         KeyCode::Char('d') => app.mode = Mode::Description,
+        KeyCode::Char('v') => {
+            let path = selected_file(app).path.clone();
+            if let Err(error) = app.progress.toggle(&path) {
+                app.mode = Mode::Message(error.to_string());
+            }
+        }
         KeyCode::Char('c') => {
             app.comment_index = app.comments.len().saturating_sub(1);
             app.mode = Mode::Comments;
@@ -1455,6 +1737,15 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
             if matches!(app.focus, Focus::Files) {
                 app.sidebar_visible = false;
                 app.focus = Focus::Diff;
+                app.diff_navigation = DiffNavigation::Block;
+                move_change_block(app, 0);
+            } else if matches!(app.diff_navigation, DiffNavigation::Block) {
+                if selected_block_has_one_line(app) && selected_comment_target(app).is_some() {
+                    app.editor.reset();
+                    app.mode = Mode::Compose;
+                } else {
+                    app.diff_navigation = DiffNavigation::Line;
+                }
             } else if selected_comment_target(app).is_some() {
                 app.editor.reset();
                 app.mode = Mode::Compose
@@ -1561,19 +1852,31 @@ fn review_pull_request(
     terminal: &mut AppTerminal,
     pr_number: String,
     repo: String,
+    syntax_set: &SyntaxSet,
+    syntax_theme: &Theme,
 ) -> Result<bool> {
-    let pull_json = gh(&[
-        "pr",
-        "view",
-        &pr_number,
-        "--repo",
-        &repo,
-        "--json",
-        "title,body,author,headRefName,baseRefName,baseRefOid,headRefOid",
-    ])?;
+    let (pull_json, diff_result) = std::thread::scope(|scope| {
+        let pull_request = scope.spawn(|| {
+            gh(&[
+                "pr",
+                "view",
+                &pr_number,
+                "--repo",
+                &repo,
+                "--json",
+                "title,body,author,headRefName,baseRefName,baseRefOid,headRefOid",
+            ])
+        });
+        let diff_request = scope.spawn(|| gh(&["pr", "diff", &pr_number, "--repo", &repo]));
+        (pull_request.join(), diff_request.join())
+    });
+    let pull_json =
+        pull_json.map_err(|_| anyhow::anyhow!("pull request metadata request panicked"))??;
     let pull: PullRequest =
         serde_json::from_str(&pull_json).context("could not parse pull request")?;
-    let diff = match gh(&["pr", "diff", &pr_number, "--repo", &repo]) {
+    let diff_result =
+        diff_result.map_err(|_| anyhow::anyhow!("pull request diff request panicked"))?;
+    let diff = match diff_result {
         Ok(diff) => diff,
         Err(error) if error.to_string().contains("PullRequest.diff too_large") => {
             local_pr_diff(&pr_number, &repo, &pull).context(
@@ -1590,12 +1893,8 @@ fn review_pull_request(
             repo
         );
     }
-    let syntax_set = SyntaxSet::load_defaults_newlines();
-    let syntax_theme = ThemeSet::load_defaults()
-        .themes
-        .remove("base16-ocean.dark")
-        .context("could not load default syntax theme")?;
-    highlight_files(&mut files, &syntax_set, &syntax_theme);
+    highlight_files(&mut files, syntax_set, syntax_theme);
+    let progress = ReviewProgress::load(&repo, &pr_number, &pull.head_ref_oid)?;
     let mut app = App {
         pr_number,
         repo,
@@ -1604,6 +1903,7 @@ fn review_pull_request(
         file_index: 0,
         line_index: 0,
         focus: Focus::Files,
+        diff_navigation: DiffNavigation::Block,
         mode: Mode::Browse,
         editor: TextEditor::new(),
         comments: Vec::new(),
@@ -1614,8 +1914,10 @@ fn review_pull_request(
         sidebar_visible: true,
         files_state: ListState::default(),
         search_query: String::new(),
+        progress,
     };
     app.files_state.select(Some(0));
+    move_change_block(&mut app, 0);
     let workspace = tempfile::tempdir().context("could not create editor workspace")?;
     loop {
         terminal.draw(|frame| draw(&mut app, frame))?;
@@ -1643,6 +1945,11 @@ fn run_in_terminal(
     pulls: Vec<PullRequestChoice>,
     initial_pr: Option<String>,
 ) -> Result<()> {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let syntax_theme = ThemeSet::load_defaults()
+        .themes
+        .remove("base16-ocean.dark")
+        .context("could not load default syntax theme")?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1669,7 +1976,13 @@ fn run_in_terminal(
                     None => return Ok(()),
                 },
             };
-            if !review_pull_request(&mut terminal, pr_number, repo.clone())? {
+            if !review_pull_request(
+                &mut terminal,
+                pr_number,
+                repo.clone(),
+                &syntax_set,
+                &syntax_theme,
+            )? {
                 return Ok(());
             }
         }
@@ -1704,8 +2017,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, Author, Color, Focus, LineKind, ListState, Mode, PullRequest, TextEditor,
-        editor_overlay, handle_browse, highlight_files, line_matches, parse_diff, search,
+        App, Author, Color, DiffNavigation, Focus, LineKind, ListState, Mode, PullRequest,
+        ReviewProgress, TextEditor, change_block_at, editor_overlay, handle_browse,
+        highlight_files, line_matches, parse_diff, search,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -1787,7 +2101,7 @@ mod tests {
     #[test]
     fn search_moves_between_matches_in_both_directions() {
         let files = parse_diff(
-            "diff --git a/one.rs b/one.rs\n@@ -1 +1 @@\n needle first\ndiff --git a/two.rs b/two.rs\n@@ -1 +1 @@\n needle second\n",
+            "diff --git a/one.rs b/one.rs\n@@ -1 +1,2 @@\n+needle first\n+companion line\ndiff --git a/two.rs b/two.rs\n@@ -1 +1 @@\n+needle second\n",
         );
         let mut app = App {
             pr_number: "1".to_string(),
@@ -1807,6 +2121,7 @@ mod tests {
             file_index: 0,
             line_index: 0,
             focus: Focus::Files,
+            diff_navigation: DiffNavigation::Block,
             mode: Mode::Browse,
             editor: TextEditor::new(),
             comments: Vec::new(),
@@ -1817,6 +2132,7 @@ mod tests {
             sidebar_visible: true,
             files_state: ListState::default(),
             search_query: "needle".to_string(),
+            progress: ReviewProgress::load("owner/repo", "1", "head").unwrap(),
         };
         assert!(search(&mut app, true));
         assert_eq!((app.file_index, app.line_index), (0, 1));
@@ -1834,6 +2150,22 @@ mod tests {
         );
         assert!(!app.sidebar_visible);
         assert!(matches!(app.focus, Focus::Diff));
+        assert!(matches!(app.diff_navigation, DiffNavigation::Block));
+
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Path::new("."),
+        );
+        assert!(matches!(app.diff_navigation, DiffNavigation::Line));
+
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Path::new("."),
+        );
+        assert!(matches!(app.focus, Focus::Diff));
+        assert!(matches!(app.diff_navigation, DiffNavigation::Block));
 
         handle_browse(
             &mut app,
@@ -1842,6 +2174,36 @@ mod tests {
         );
         assert!(app.sidebar_visible);
         assert!(matches!(app.focus, Focus::Files));
+
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            Path::new("."),
+        );
+        assert_eq!(app.line_index, 1);
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Path::new("."),
+        );
+        handle_browse(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Path::new("."),
+        );
+        assert!(matches!(app.mode, Mode::Compose));
+    }
+
+    #[test]
+    fn groups_adjacent_additions_and_removals_into_change_blocks() {
+        let files = parse_diff(
+            "diff --git a/example.rs b/example.rs\n@@ -1,4 +1,5 @@\n context\n-old one\n-old two\n+new one\n+new two\n context\n+another change\n context\n",
+        );
+
+        assert_eq!(change_block_at(&files[0], 2), Some((2, 5)));
+        assert_eq!(change_block_at(&files[0], 5), Some((2, 5)));
+        assert_eq!(change_block_at(&files[0], 6), None);
+        assert_eq!(change_block_at(&files[0], 7), Some((7, 7)));
     }
 
     #[test]
@@ -1891,6 +2253,64 @@ mod tests {
         editor.handle(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
 
         assert_eq!(editor.text, "abz");
+    }
+
+    #[test]
+    fn input_editor_supports_vim_change_line() {
+        let mut editor = TextEditor::new();
+        editor.text = "keep\nreplace me\nkeep too".to_string();
+        editor.cursor = "keep\nreplace".len();
+        editor.mode = super::EditorMode::Normal;
+
+        editor.handle(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        editor.handle(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        editor.handle(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert_eq!(editor.text, "keep\nn\nkeep too");
+        assert!(matches!(editor.mode, super::EditorMode::Insert));
+    }
+
+    #[test]
+    fn input_editor_supports_vim_inner_word_operators() {
+        let mut editor = TextEditor::new();
+        editor.text = "alpha target omega".to_string();
+        editor.cursor = "alpha tar".len();
+        editor.mode = super::EditorMode::Normal;
+
+        for key in ['c', 'i', 'w'] {
+            editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert_eq!(editor.text, "alpha  omega");
+        assert_eq!(editor.cursor, "alpha ".len());
+        assert!(matches!(editor.mode, super::EditorMode::Insert));
+
+        editor.text = "alpha target omega".to_string();
+        editor.cursor = "alpha tar".len();
+        editor.mode = super::EditorMode::Normal;
+        for key in ['d', 'i', 'w'] {
+            editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert_eq!(editor.text, "alpha  omega");
+        assert!(matches!(editor.mode, super::EditorMode::Normal));
+    }
+
+    #[test]
+    fn input_editor_supports_vim_word_and_line_delete_operators() {
+        let mut editor = TextEditor::new();
+        editor.text = "one two three".to_string();
+        editor.cursor = "one ".len();
+        editor.mode = super::EditorMode::Normal;
+        for key in ['d', 'w'] {
+            editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert_eq!(editor.text, "one  three");
+
+        editor.text = "keep\ndelete\nkeep too".to_string();
+        editor.cursor = "keep\ndelete".len();
+        for key in ['d', 'd'] {
+            editor.handle(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert_eq!(editor.text, "keep\nkeep too");
     }
 
     #[test]

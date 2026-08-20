@@ -22,11 +22,12 @@ The reviewer uses the repository in the current directory and opens with a picke
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Move through the focused file list or diff |
+| `j` / `k` | Move through files or change blocks; move by line after entering a block |
 | `Ctrl-d` / `Ctrl-u` | Page down or up in the focused pane |
 | `h` / `l` | Previous or next changed file |
-| `Enter` | Open the selected file from the sidebar, or add an inline comment from a diff |
-| `Esc` | Return from the diff to the file sidebar |
+| `Enter` | Open a file, enter a change block, or comment on the selected line |
+| `v` | Mark the current file as viewed (press again to undo) |
+| `Esc` | Leave line mode, then return from the diff to the file sidebar |
 | `/` | Search changed lines across files, with incremental highlights in the diff |
 | `n` / `N` | Jump to the next or previous search result |
 | `Tab` | Switch between files and diff panes |
@@ -47,3 +48,7 @@ The reviewer uses the repository in the current directory and opens with a picke
 ```
 
 Comments are only submitted when an action is chosen from the submit dialog. Quit never posts a review.
+
+Comment and command inputs support Vim-style normal-mode editing, including `cc`, `dd`, `cw`, `dw`, `ciw`, and `diw`.
+
+Viewed-file progress is saved locally and restored the next time the same pull request is opened. It resets automatically when the pull request head commit changes.
