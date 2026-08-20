@@ -40,6 +40,7 @@ const REMOVED: Color = Color::Red;
 const REMOVED_BACKGROUND: Color = Color::Rgb(48, 34, 34);
 const MUTED: Color = Color::DarkGray;
 const SEARCH_MATCH: Color = Color::Yellow;
+const REPORT_EVIDENCE_BACKGROUND: Color = Color::Rgb(55, 42, 76);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +170,14 @@ struct ReportSection {
     title: &'static str,
     instruction: &'static str,
     state: SectionState,
+}
+
+#[derive(Clone)]
+struct CodeReference {
+    raw: String,
+    path: String,
+    start: u32,
+    end: u32,
 }
 
 fn report_sections() -> Vec<ReportSection> {
@@ -419,6 +428,8 @@ struct App {
     report_sections: Vec<ReportSection>,
     report_section: usize,
     report_content_focus: bool,
+    report_reference: usize,
+    report_highlight: Option<(usize, u32, u32)>,
 }
 
 struct ReviewTarget {
@@ -604,6 +615,78 @@ fn poll_report_sections(app: &mut App) {
             }
         }
     }
+}
+
+fn section_text(section: &ReportSection) -> &str {
+    match &section.state {
+        SectionState::Idle => "",
+        SectionState::Loading { text, .. }
+        | SectionState::Ready(text)
+        | SectionState::Failed(text) => text,
+    }
+}
+
+fn report_references(app: &App) -> Vec<CodeReference> {
+    let text = section_text(&app.report_sections[app.report_section]);
+    let mut references = Vec::new();
+    for token in text.split('`').skip(1).step_by(2) {
+        for file in &app.files {
+            let Some(lines) = token
+                .strip_prefix(&file.path)
+                .and_then(|rest| rest.strip_prefix(':'))
+            else {
+                continue;
+            };
+            let mut parts = lines.splitn(2, '-');
+            let Some(start) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+                continue;
+            };
+            let end = parts
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(start);
+            references.push(CodeReference {
+                raw: token.to_string(),
+                path: file.path.clone(),
+                start: start.min(end),
+                end: start.max(end),
+            });
+            break;
+        }
+    }
+    references
+}
+
+fn jump_to_report_reference(app: &mut App) {
+    let references = report_references(app);
+    let Some(reference) = references.get(app.report_reference) else {
+        return;
+    };
+    let Some(file_index) = app
+        .files
+        .iter()
+        .position(|file| file.path == reference.path)
+    else {
+        return;
+    };
+    app.file_index = file_index;
+    app.files_state.select(Some(file_index));
+    app.line_index = app.files[file_index]
+        .lines
+        .iter()
+        .position(|line| {
+            line.new_line
+                .or(line.old_line)
+                .is_some_and(|number| (reference.start..=reference.end).contains(&number))
+        })
+        .unwrap_or(0);
+    app.sidebar_visible = false;
+    app.focus = Focus::Diff;
+    app.diff_navigation = DiffNavigation::Block;
+    app.center_diff = true;
+    app.return_to_briefing = true;
+    app.report_highlight = Some((file_index, reference.start, reference.end));
+    app.briefing_open = false;
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -1583,11 +1666,12 @@ fn update_diff_scroll(app: &mut App, visible_height: usize) {
 }
 
 fn draw(app: &mut App, frame: &mut ratatui::Frame) {
+    let area = frame.area();
     if app.briefing_open {
         draw_briefing(app, frame);
+        draw_overlay(app, frame, area);
         return;
     }
-    let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1708,90 +1792,110 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     let file = selected_file(app);
     let search_query = active_search_query(app).to_string();
     let normalized_search_query = search_query.to_lowercase();
-    let diff_lines: Vec<Line> = file
-        .lines
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_height)
-        .map(|(index, line)| {
-            let old = line
-                .old_line
-                .map_or("    ".to_string(), |number| format!("{number:>4}"));
-            let new = line
-                .new_line
-                .map_or("    ".to_string(), |number| format!("{number:>4}"));
-            let sign = match line.kind {
-                LineKind::Add => "+",
-                LineKind::Remove => "-",
-                _ => " ",
-            };
-            let active_range = change_block_at(file, app.line_index);
-            let active_block =
-                active_range.is_some_and(|(start, end)| (start..=end).contains(&index));
-            let selected =
-                matches!(app.diff_navigation, DiffNavigation::Line) && index == app.line_index;
-            let marker = if selected {
-                "▶"
-            } else if let Some((start, end)) = active_range.filter(|_| active_block) {
-                if start == end {
-                    "◆"
-                } else if index == start {
-                    "┏"
-                } else if index == end {
-                    "┗"
-                } else {
-                    "┃"
-                }
-            } else {
-                " "
-            };
-            let matched =
-                !normalized_search_query.is_empty() && line_matches(line, &normalized_search_query);
-            let mut style = line_style(line.kind);
-            if matched && !active_block {
-                style = style.bg(Color::DarkGray);
-            }
-            let line_prefix = format!("{old} {new} {sign} ");
-            let marker_style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else if active_block {
-                line_style(line.kind)
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                style
-            };
-            let mut spans = vec![
-                Span::styled(marker, marker_style),
-                Span::styled(line_prefix, style),
-            ];
-            let mut syntax_spans: Vec<Span> = file.syntax_lines[index]
-                .iter()
-                .map(|span| Span::styled(span.text.clone(), Style::default().fg(span.color)))
-                .collect();
-            if syntax_spans.is_empty() {
-                syntax_spans.push(Span::raw(line.text.clone()));
-            }
-            for span in &mut syntax_spans {
-                span.style = if matched && !active_block {
-                    span.style.bg(Color::DarkGray)
-                } else {
-                    match line.kind {
-                        LineKind::Add => span.style.bg(ADDED_BACKGROUND),
-                        LineKind::Remove => span.style.bg(REMOVED_BACKGROUND),
-                        _ => span.style,
-                    }
+    let diff_lines: Vec<Line> =
+        file.lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_height)
+            .map(|(index, line)| {
+                let old = line
+                    .old_line
+                    .map_or("    ".to_string(), |number| format!("{number:>4}"));
+                let new = line
+                    .new_line
+                    .map_or("    ".to_string(), |number| format!("{number:>4}"));
+                let sign = match line.kind {
+                    LineKind::Add => "+",
+                    LineKind::Remove => "-",
+                    _ => " ",
                 };
-            }
-            syntax_spans = mark_search_matches(syntax_spans, &search_query);
-            spans.extend(syntax_spans);
-            Line::from(spans)
-        })
-        .collect();
+                let active_range = change_block_at(file, app.line_index);
+                let active_block =
+                    active_range.is_some_and(|(start, end)| (start..=end).contains(&index));
+                let selected =
+                    matches!(app.diff_navigation, DiffNavigation::Line) && index == app.line_index;
+                let cited =
+                    app.report_highlight
+                        .is_some_and(|(file_index, range_start, range_end)| {
+                            file_index == app.file_index
+                                && line.new_line.or(line.old_line).is_some_and(|number| {
+                                    (range_start..=range_end).contains(&number)
+                                })
+                        });
+                let marker = if selected {
+                    "▶"
+                } else if let Some((start, end)) = active_range.filter(|_| active_block) {
+                    if start == end {
+                        "◆"
+                    } else if index == start {
+                        "┏"
+                    } else if index == end {
+                        "┗"
+                    } else {
+                        "┃"
+                    }
+                } else if cited {
+                    "▐"
+                } else {
+                    " "
+                };
+                let matched = !normalized_search_query.is_empty()
+                    && line_matches(line, &normalized_search_query);
+                let mut style = line_style(line.kind);
+                if matched && !active_block {
+                    style = style.bg(Color::DarkGray);
+                }
+                if cited {
+                    style = style.bg(REPORT_EVIDENCE_BACKGROUND);
+                }
+                let line_prefix = format!("{old} {new} {sign} ");
+                let marker_style = if selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else if cited {
+                    Style::default()
+                        .fg(Color::LightMagenta)
+                        .bg(REPORT_EVIDENCE_BACKGROUND)
+                        .add_modifier(Modifier::BOLD)
+                } else if active_block {
+                    line_style(line.kind)
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                };
+                let mut spans = vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(line_prefix, style),
+                ];
+                let mut syntax_spans: Vec<Span> = file.syntax_lines[index]
+                    .iter()
+                    .map(|span| Span::styled(span.text.clone(), Style::default().fg(span.color)))
+                    .collect();
+                if syntax_spans.is_empty() {
+                    syntax_spans.push(Span::raw(line.text.clone()));
+                }
+                for span in &mut syntax_spans {
+                    span.style = if cited {
+                        span.style.bg(REPORT_EVIDENCE_BACKGROUND)
+                    } else if matched && !active_block {
+                        span.style.bg(Color::DarkGray)
+                    } else {
+                        match line.kind {
+                            LineKind::Add => span.style.bg(ADDED_BACKGROUND),
+                            LineKind::Remove => span.style.bg(REMOVED_BACKGROUND),
+                            _ => span.style,
+                        }
+                    };
+                }
+                syntax_spans = mark_search_matches(syntax_spans, &search_query);
+                spans.extend(syntax_spans);
+                Line::from(spans)
+            })
+            .collect();
     let diff = Paragraph::new(Text::from(diff_lines))
         .block(
             Block::default()
@@ -1855,18 +1959,27 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     draw_overlay(app, frame, area);
 }
 
-fn markdown_inline(mut source: &str) -> Vec<Span<'static>> {
+fn markdown_inline(mut source: &str, references: &[String], selected: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     while !source.is_empty() {
         if let Some(rest) = source.strip_prefix('`')
             && let Some(end) = rest.find('`')
         {
-            spans.push(Span::styled(
-                rest[..end].to_string(),
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .bg(Color::Rgb(35, 35, 42)),
-            ));
+            let value = &rest[..end];
+            let reference = references.iter().position(|path| value.contains(path));
+            let mut style = Style::default()
+                .fg(Color::LightCyan)
+                .bg(Color::Rgb(35, 35, 42));
+            if let Some(index) = reference {
+                style = style.add_modifier(Modifier::UNDERLINED);
+                if index == selected {
+                    style = style
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD);
+                }
+            }
+            spans.push(Span::styled(value.to_string(), style));
             source = &rest[end + 1..];
             continue;
         }
@@ -1892,7 +2005,7 @@ fn markdown_inline(mut source: &str) -> Vec<Span<'static>> {
     spans
 }
 
-fn markdown_text(source: &str) -> Text<'static> {
+fn markdown_text(source: &str, references: &[String], selected: usize) -> Text<'static> {
     let mut code = false;
     let lines = source
         .lines()
@@ -1907,6 +2020,16 @@ fn markdown_text(source: &str) -> Text<'static> {
                     raw.to_string(),
                     Style::default().fg(Color::LightGreen),
                 ));
+            }
+            if let Some(callout) = trimmed.strip_prefix("> ") {
+                let mut spans = vec![Span::styled(
+                    "┃ ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(markdown_inline(callout, references, selected));
+                return Some(Line::from(spans).style(Style::default().bg(Color::Rgb(42, 40, 28))));
             }
             if let Some(heading) = trimmed
                 .strip_prefix("### ")
@@ -1923,7 +2046,7 @@ fn markdown_text(source: &str) -> Text<'static> {
                 .or_else(|| trimmed.strip_prefix("* "))
             {
                 let mut spans = vec![Span::styled("• ", Style::default().fg(ACCENT))];
-                spans.extend(markdown_inline(item));
+                spans.extend(markdown_inline(item, references, selected));
                 return Some(Line::from(spans));
             }
             if let Some((number, item)) = trimmed.split_once(". ")
@@ -1933,10 +2056,10 @@ fn markdown_text(source: &str) -> Text<'static> {
                     format!("{number}. "),
                     Style::default().fg(ACCENT),
                 )];
-                spans.extend(markdown_inline(item));
+                spans.extend(markdown_inline(item, references, selected));
                 return Some(Line::from(spans));
             }
-            Some(Line::from(markdown_inline(raw)))
+            Some(Line::from(markdown_inline(raw, references, selected)))
         })
         .collect::<Vec<_>>();
     Text::from(lines)
@@ -2000,6 +2123,12 @@ fn draw_briefing(app: &mut App, frame: &mut ratatui::Frame) {
             columns[0],
             &mut state,
         );
+        let references = report_references(app);
+        let reference_labels = references
+            .iter()
+            .map(|reference| reference.raw.clone())
+            .collect::<Vec<_>>();
+        app.report_reference = app.report_reference.min(references.len().saturating_sub(1));
         let section = &app.report_sections[app.report_section];
         let (status, source) = match &section.state {
             SectionState::Idle => (
@@ -2014,26 +2143,30 @@ fn draw_briefing(app: &mut App, frame: &mut ratatui::Frame) {
             SectionState::Failed(error) => ("failed · Enter retries", error.as_str()),
         };
         frame.render_widget(
-            Paragraph::new(markdown_text(source))
-                .scroll((app.briefing_scroll, 0))
-                .block(
-                    Block::default()
-                        .title(format!(" {} · {} ", section.title, status))
-                        .borders(Borders::ALL)
-                        .border_style(if app.report_content_focus {
-                            Style::default().fg(ACCENT)
-                        } else {
-                            Style::default()
-                        }),
-                )
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(markdown_text(
+                source,
+                &reference_labels,
+                app.report_reference,
+            ))
+            .scroll((app.briefing_scroll, 0))
+            .block(
+                Block::default()
+                    .title(format!(" {} · {} ", section.title, status))
+                    .borders(Borders::ALL)
+                    .border_style(if app.report_content_focus {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default()
+                    }),
+            )
+            .wrap(Wrap { trim: false }),
             columns[1],
         );
         frame.render_widget(
             Paragraph::new(if app.report_content_focus {
-                " CONTENT  j/k scroll  Esc sections  r regenerate"
+                " CONTENT  j/k scroll  n/N link  Enter jump  Esc sections  r regenerate  : commands"
             } else {
-                " SECTIONS  j/k select  Enter open/generate  Esc review"
+                " SECTIONS  j/k select  Enter open/generate  Esc review  : commands"
             })
             .style(Style::default().fg(MUTED)),
             layout[2],
@@ -2541,7 +2674,10 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
     if app.briefing_open {
         if !app.report_sections.is_empty() {
             match key.code {
-                KeyCode::Char('q') => request_quit(app),
+                KeyCode::Char(':') => {
+                    app.editor.reset();
+                    app.mode = Mode::Command;
+                }
                 KeyCode::Esc if app.report_content_focus => {
                     app.report_content_focus = false;
                     app.briefing_scroll = 0;
@@ -2550,7 +2686,16 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
                 KeyCode::Enter if !app.report_content_focus => {
                     app.report_content_focus = true;
                     app.briefing_scroll = 0;
+                    app.report_reference = 0;
                     start_report_section(app, app.report_section);
+                }
+                KeyCode::Enter if app.report_content_focus => jump_to_report_reference(app),
+                KeyCode::Char('n') if app.report_content_focus => {
+                    app.report_reference = (app.report_reference + 1)
+                        .min(report_references(app).len().saturating_sub(1));
+                }
+                KeyCode::Char('N') if app.report_content_focus => {
+                    app.report_reference = app.report_reference.saturating_sub(1);
                 }
                 KeyCode::Char('r') if app.report_content_focus => {
                     app.report_sections[app.report_section].state = SectionState::Idle;
@@ -2561,10 +2706,12 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
                     app.report_section =
                         (app.report_section + 1).min(app.report_sections.len() - 1);
                     app.briefing_scroll = 0;
+                    app.report_reference = 0;
                 }
                 KeyCode::Char('k') | KeyCode::Up if !app.report_content_focus => {
                     app.report_section = app.report_section.saturating_sub(1);
                     app.briefing_scroll = 0;
+                    app.report_reference = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     app.briefing_scroll = app.briefing_scroll.saturating_add(1)
@@ -2989,6 +3136,8 @@ fn review_pull_request(
         report_sections: report_sections(),
         report_section: 0,
         report_content_focus: false,
+        report_reference: 0,
+        report_highlight: None,
     };
     app.files_state.select(Some(0));
     move_change_block(&mut app, 0);
@@ -3003,7 +3152,7 @@ fn review_pull_request(
         if app.return_to_picker {
             return Ok(true);
         }
-        if event::poll(Duration::from_millis(250))?
+        if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && key.kind == event::KeyEventKind::Press
         {
@@ -3142,7 +3291,11 @@ mod tests {
 
     #[test]
     fn styles_inline_markdown_code_and_bold_text() {
-        let spans = markdown_inline("Call `load_user` with **validated** input");
+        let spans = markdown_inline(
+            "Call `load_user` with **validated** input",
+            &["load_user".to_string()],
+            usize::MAX,
+        );
         assert_eq!(spans[1].content, "load_user");
         assert_eq!(spans[1].style.fg, Some(Color::LightCyan));
         assert!(
@@ -3274,6 +3427,8 @@ mod tests {
             report_sections: report_sections(),
             report_section: 0,
             report_content_focus: false,
+            report_reference: 0,
+            report_highlight: None,
         };
         assert!(search(&mut app, true));
         assert_eq!((app.file_index, app.line_index), (0, 1));

@@ -22,9 +22,11 @@ By default, the reviewer uses the repository in the current directory. Use `--re
 
 ## PR briefing companion
 
-Press `b` from a review to open the briefing. Its sidebar separates Overview, Data & contracts, Functions, Flow, Tests, and Risks & review plan. Use `j`/`k` to select a section and `Enter` to open and lazily generate only that section. Generated Markdown is rendered as styled terminal content while it streams. `Esc` returns to the section list; sections continue independently in the background, so several can generate concurrently.
+Press `b` from a review to open the briefing. Its sidebar separates Overview, Data & contracts, Functions, Flow, Tests, and Risks & review plan. Use `j`/`k` to select a section and `Enter` to open and lazily generate only that section. Generated Markdown is rendered with styled headings, lists, callouts, inline code, and code blocks while it streams. Changed-file references are underlined: use `n`/`N` to select one and `Enter` to jump to its diff; `Esc` returns to the report. The standard `:` command palette is available in the briefing.
 
 This feature requires `pi` on `PATH` and a configured OpenRouter provider. Reports use `openrouter/deepseek/deepseek-v4-flash` with reasoning disabled and a compact change digest; tools, extensions, and skills are disabled so PI cannot modify the checkout.
+
+Override the report model without rebuilding by setting `REVIEWER_PI_PROVIDER` and `REVIEWER_PI_MODEL`. For example: `REVIEWER_PI_PROVIDER=openrouter REVIEWER_PI_MODEL=<openrouter-model-id> reviewer`.
 
 ## Navigation model
 

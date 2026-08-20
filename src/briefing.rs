@@ -102,16 +102,28 @@ fn section_diff(section: &str, diff: &str) -> String {
     let section = section.to_ascii_lowercase();
     let mut result = String::new();
     let mut current_file = String::new();
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
     for line in diff.lines() {
-        if line.starts_with("diff --git")
-            || line.starts_with("@@")
-            || line.starts_with("+++")
-            || line.starts_with("---")
-        {
-            if line.starts_with("diff --git") {
-                current_file = line.to_ascii_lowercase();
-            }
-        } else if !line.starts_with('+') && !line.starts_with('-') {
+        if line.starts_with("diff --git") {
+            current_file = line.to_ascii_lowercase();
+        } else if line.starts_with("@@") {
+            let mut pieces = line.split_whitespace();
+            let _ = pieces.next();
+            old_line = pieces
+                .next()
+                .and_then(|value| value.trim_start_matches('-').split(',').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            new_line = pieces
+                .next()
+                .and_then(|value| value.trim_start_matches('+').split(',').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+        } else if let Some(text) = line.strip_prefix(' ') {
+            let _ = text;
+            old_line += 1;
+            new_line += 1;
             continue;
         }
         let lower = line.to_ascii_lowercase();
@@ -147,12 +159,27 @@ fn section_diff(section: &str, diff: &str) -> String {
                     || current_file.contains("spec")
                     || lower.contains("test")));
         if relevant || line.starts_with("diff --git") || line.starts_with("@@") {
-            if result.len() + line.len() + 1 > 3_500 {
+            let rendered = if let Some(text) =
+                line.strip_prefix('+').filter(|_| !line.starts_with("+++"))
+            {
+                format!("+{new_line}: {text}")
+            } else if let Some(text) = line.strip_prefix('-').filter(|_| !line.starts_with("---")) {
+                format!("-{old_line}: {text}")
+            } else {
+                line.to_string()
+            };
+            if result.len() + rendered.len() + 1 > 3_500 {
                 result.push_str("\n[digest truncated]");
                 break;
             }
-            result.push_str(line);
+            result.push_str(&rendered);
             result.push('\n');
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            new_line += 1;
+        }
+        if line.starts_with('-') && !line.starts_with("---") {
+            old_line += 1;
         }
     }
     result
@@ -167,7 +194,7 @@ pub fn review_prompt(
 ) -> String {
     let clipped_diff = section_diff(section, diff);
     format!(
-        r#"Write one concise section of a peer-review briefing in at most 120 words. Return readable Markdown using short bullets; use inline backticks for symbols and paths. No introduction, conclusion, or repeated diff. Do not include the section title. Cite paths, distinguish facts from inference, and do not modify or submit anything.
+        r#"Write one high-signal section of a peer-review briefing in 90–140 words. Return readable Markdown using short bullets and `inline code`. Every factual bullet MUST end with a precise changed-code citation in backticks using `path:start-end` or `path:line` (for example `src/auth.rs:84-101`). Use `>` callouts for the most important reviewer warning. No introduction, conclusion, or repeated diff. Do not include the section title. Distinguish facts from inference, and do not modify or submit anything.
 
 SECTION: {section}
 FOCUS: {instruction}
@@ -205,14 +232,18 @@ fn generate_stream_inner(
     sender: &Sender<BriefingEvent>,
 ) -> Result<String> {
     let prompt = review_prompt(section, instruction, title, body, diff);
+    let provider =
+        std::env::var("REVIEWER_PI_PROVIDER").unwrap_or_else(|_| "openrouter".to_string());
+    let model = std::env::var("REVIEWER_PI_MODEL")
+        .unwrap_or_else(|_| "deepseek/deepseek-v4-flash".to_string());
     let mut child = Command::new("pi")
         .args([
             "--mode",
             "json",
             "--provider",
-            "openrouter",
+            &provider,
             "--model",
-            "deepseek/deepseek-v4-flash",
+            &model,
             "--no-session",
             "--no-tools",
             "--no-skills",
@@ -296,6 +327,6 @@ mod tests {
             "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n context\n-old\n+new\n",
         );
         assert!(!compact.contains(" context"));
-        assert!(compact.contains("-old\n+new"));
+        assert!(compact.contains("-2: old\n+2: new"));
     }
 }
