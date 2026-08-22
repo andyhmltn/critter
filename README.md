@@ -55,7 +55,7 @@ When a PR opens, reviewer starts building a logical review plan in the backgroun
 
 Completed plans are cached per repository, PR number, and head commit under the user's cache directory, so reopening an unchanged PR is immediate and a new head commit automatically receives a fresh plan. Set `REVIEWER_PI_PROVIDER` and `REVIEWER_PI_MODEL` to override the defaults. This feature sends a compacted PR diff to the configured model provider; `pi` runs without tools, skills, extensions, or a persistent session.
 
-Inline comments remain local until a review is submitted with `s`. Files can be marked viewed with `v`; that progress is saved locally per repository, PR, and head commit. Changed lines can be searched incrementally with `/`, then revisited with `n` and `N`.
+Inline comments remain local until a review is submitted with `s`. Pending comments are autosaved atomically per repository, PR, and head commit, then restored when the same review is reopened after a crash or interrupted session. A successful submission removes the saved draft; comments from an older head are never mixed into the new diff. Files can be marked viewed with `v`; that progress is saved locally per repository, PR, and head commit. Changed lines can be searched incrementally with `/`, then revisited with `n` and `N`.
 
 ## Keys
 
@@ -86,7 +86,7 @@ Inline comments remain local until a review is submitted with `s`. Files can be 
 
 ## Command and text input
 
-Press `:` from the review to open the command panel. `:q` refuses to quit and displays a warning while unsubmitted review comments exist. Use `:q!` to explicitly discard those comments and quit anyway. Direct `q` and returning to the PR picker retain the safe behavior.
+Press `:` from the review to open the command panel. `:q` refuses to quit and displays a warning while unsubmitted review comments exist. Use `:q!` to explicitly delete the saved draft and quit anyway. Direct `q` and returning to the PR picker retain the safe behavior.
 
 Search, comment, summary, and command inputs use the `vimltui` editing engine with insert, normal, replace, and visual modes. Press `Esc` once to enter normal mode and again to cancel the input; a blank comment closes immediately on the first `Esc`. Vim operator–motion composition, counts, registers, text objects, character-find motions, undo/redo, and dot-repeat are supported—for example `c$`, `d2w`, `ciw`, `ci"`, `f<char>`, `u`, and `.`. In multiline comment inputs, `Ctrl+Enter` inserts a newline.
 

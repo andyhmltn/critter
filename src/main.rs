@@ -31,7 +31,7 @@ mod progress;
 
 use briefing::BriefingEvent;
 use flow::{FlowEvent, FlowPlan};
-use progress::{ReviewProgress, load_picker_query, save_picker_query};
+use progress::{ReviewDraft, ReviewProgress, load_picker_query, save_picker_query};
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -77,7 +77,7 @@ struct Author {
     login: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 enum Side {
     Left,
@@ -114,8 +114,8 @@ struct CodeSpan {
     color: Color,
 }
 
-#[derive(Clone, Serialize)]
-struct PendingComment {
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct PendingComment {
     path: String,
     line: u32,
     side: Side,
@@ -603,6 +603,7 @@ struct App {
     mode: Mode,
     editor: TextEditor,
     comments: Vec<PendingComment>,
+    draft: ReviewDraft,
     comment_index: usize,
     should_quit: bool,
     return_to_picker: bool,
@@ -3444,7 +3445,17 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
             EditorAction::Cancel => app.mode = Mode::Browse,
             EditorAction::Submit => match app.editor.text.trim() {
                 "q" => request_quit(app),
-                "q!" => app.should_quit = true,
+                "q!" => match app.draft.clear() {
+                    Ok(()) => {
+                        app.comments.clear();
+                        app.should_quit = true;
+                    }
+                    Err(error) => {
+                        app.mode = Mode::Message(format!(
+                            "Could not discard the saved review draft: {error}"
+                        ));
+                    }
+                },
                 command => {
                     app.mode = Mode::Message(format!("Unknown command: :{command}"));
                 }
@@ -3463,6 +3474,9 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
             KeyCode::Char('x') if !app.comments.is_empty() => {
                 app.comments.remove(app.comment_index);
                 app.comment_index = app.comment_index.min(app.comments.len().saturating_sub(1));
+                if let Err(error) = app.draft.save(&app.comments) {
+                    app.mode = Mode::Message(format!("Could not save review draft: {error}"));
+                }
             }
             _ => {}
         },
@@ -3491,8 +3505,13 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
                 let summary = app.editor.text.trim().to_string();
                 match submit(app, event, &summary) {
                     Ok(()) => {
-                        app.mode = Mode::Message(format!("Review submitted as {}.", event));
                         app.comments.clear();
+                        app.mode = match app.draft.clear() {
+                            Ok(()) => Mode::Message(format!("Review submitted as {}.", event)),
+                            Err(error) => Mode::Message(format!(
+                                "Review submitted as {event}, but its local draft could not be cleared: {error}"
+                            )),
+                        };
                     }
                     Err(error) => app.mode = Mode::Message(error.to_string()),
                 }
@@ -3515,6 +3534,10 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
                         side,
                         body,
                     });
+                    if let Err(error) = app.draft.save(&app.comments) {
+                        app.mode = Mode::Message(format!("Could not save review draft: {error}"));
+                        return;
+                    }
                 }
                 app.mode = Mode::Browse;
             }
@@ -3570,6 +3593,8 @@ fn review_pull_request(
     }
     highlight_files(&mut files, syntax_set, syntax_theme);
     let progress = ReviewProgress::load(&repo, &pr_number, &pull.head_ref_oid)?;
+    let draft = ReviewDraft::load(&repo, &pr_number, &pull.head_ref_oid)?;
+    let comments = draft.comments().to_vec();
     let report_sections = report_sections(&files, &diff);
     let flow_state = start_flow_analysis(&repo, &pr_number, &pull.head_ref_oid, &pull.title, &diff);
     let flow_view = matches!(&flow_state, FlowState::Ready(_));
@@ -3584,7 +3609,8 @@ fn review_pull_request(
         diff_navigation: DiffNavigation::Block,
         mode: Mode::Browse,
         editor: TextEditor::new(),
-        comments: Vec::new(),
+        comments,
+        draft,
         comment_index: 0,
         should_quit: false,
         return_to_picker: false,
@@ -3760,9 +3786,9 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         App, Author, BriefingState, Color, DiffNavigation, FlowState, Focus, LineKind, ListState,
-        Mode, PendingComment, PullRequest, ReviewProgress, Side, TextEditor, active_author_prefix,
-        author_suggestions, change_block_at, complete_author, editor_overlay, editor_render_text,
-        editor_status_label, handle_browse, handle_event, highlight_files,
+        Mode, PendingComment, PullRequest, ReviewDraft, ReviewProgress, Side, TextEditor,
+        active_author_prefix, author_suggestions, change_block_at, complete_author, editor_overlay,
+        editor_render_text, editor_status_label, handle_browse, handle_event, highlight_files,
         is_entirely_added_or_removed, line_matches, markdown_inline, parse_cli_args, parse_diff,
         report_sections, search, update_diff_scroll,
     };
@@ -3904,6 +3930,7 @@ mod tests {
             mode: Mode::Browse,
             editor: TextEditor::new(),
             comments: Vec::new(),
+            draft: ReviewDraft::load("owner/repo", "1", "head").unwrap(),
             comment_index: 0,
             should_quit: false,
             return_to_picker: false,
