@@ -1,0 +1,18 @@
+{
+  "name": "reviewer-codex",
+  "version": "0.1.0",
+  "description": "Local Reviewer self-review loops for Codex sessions",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Reviewer Codex",
+    "shortDescription": "Review local diffs before PRs.",
+    "longDescription": "Reviewer opens a local working-tree diff and returns submitted feedback to the same Codex session.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use $local-review when I explicitly ask for a local review."
+  }
+}

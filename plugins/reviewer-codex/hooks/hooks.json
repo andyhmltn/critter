@@ -1,0 +1,16 @@
+{
+  "description": "Connect Reviewer local submissions to the active Codex session.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "reviewer codex-session-start"
+          }
+        ]
+      }
+    ]
+  }
+}
