@@ -31,6 +31,10 @@ reviewer -R owner/repo 447
 
 Comments stay local until you submit. Press `P` to approve, request changes, or leave a comment.
 
+When choosing a pull request, press `/` to filter with GitHub search qualifiers such as
+`author:octocat` or `is:open`. Critter remembers the last search for each repository.
+Press `r` to refresh the results without losing the currently selected pull request.
+
 ## 🤖 Review with an agent
 
 Run Critter from the agent's tmux session and wait for the submitted feedback:
@@ -80,8 +84,9 @@ flag to review the current branch pull request.
 | `h` / `l` | Previous / next file |
 | `Enter` | Open or comment |
 | `Shift+Enter` | Insert a newline in a comment |
+| `/` | Search pull requests or changed lines |
+| `r` | Refresh the pull-request picker |
 | `V` | Select individual lines |
-| `/` | Search changed lines |
 | `n` / `N` | Next / previous search result |
 | `v` | Mark file viewed |
 | `o` | Open the current line in `$EDITOR` |
