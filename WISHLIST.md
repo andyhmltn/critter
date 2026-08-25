@@ -1,4 +1,0 @@
-- local review, but only unstaged changes
-	- Run based on current changes
-- way to refresh PR list
-- remove basic PR ai review, it's not needed
