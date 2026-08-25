@@ -6,7 +6,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -601,10 +604,10 @@ impl TextEditor {
         if matches!(self.mode, EditorMode::Insert) && matches!(key.code, KeyCode::Enter) {
             if key
                 .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL)
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
             {
                 key.modifiers
-                    .remove(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+                    .remove(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT);
             } else {
                 return EditorAction::Submit;
             }
@@ -1842,20 +1845,11 @@ fn active_search_query(app: &App) -> &str {
 fn editor_overlay(area: Rect, editor: &TextEditor) -> Rect {
     let width = area.width * 8 / 10;
     let content_width = width.saturating_sub(2).max(1) as usize;
-    let mut lines = 1usize;
-    let mut line_width = 0usize;
-    for character in editor.text.chars() {
-        if character == '\n' {
-            lines += 1;
-            line_width = 0;
-        } else {
-            line_width += 1;
-            if line_width > content_width {
-                lines += 1;
-                line_width = 1;
-            }
-        }
-    }
+    let lines = editor
+        .text
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(content_width))
+        .sum::<usize>();
     let height = (lines as u16 + 2).clamp(3, area.height * 3 / 4);
     Rect {
         x: area.x + area.width / 10,
@@ -1890,12 +1884,22 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
         .map_or(text.len(), |character| index + character.len_utf8())
 }
 
+fn editor_plain_text(editor: &TextEditor) -> Text<'static> {
+    Text::from(
+        editor
+            .text
+            .split('\n')
+            .map(|line| Line::raw(line.to_string()))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn editor_render_text(editor: &TextEditor) -> Text<'static> {
     let VimMode::Visual(kind) = &editor.engine.mode else {
-        return Text::from(editor.text.clone());
+        return editor_plain_text(editor);
     };
     let Some(anchor) = editor.engine.visual_anchor else {
-        return Text::from(editor.text.clone());
+        return editor_plain_text(editor);
     };
     let cursor = (editor.engine.cursor_row, editor.engine.cursor_col);
     let (start, end) = if anchor <= cursor {
@@ -2524,12 +2528,12 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         }
         Mode::Search { .. } => "Enter confirm  Esc normal  Esc again cancel",
         Mode::Command => "Enter run  Esc normal  Esc again cancel",
-        Mode::Compose => "Enter save  Ctrl+Enter newline  Esc normal  Esc again cancel",
+        Mode::Compose => "Enter save  Alt+Enter newline  Esc normal  Esc again cancel",
         Mode::Submit if app.local_review.is_some() => {
             "s submit to Codex  x copy handoff  Esc cancel"
         }
         Mode::Submit => "a approve  r request changes  c comment  x copy handoff  Esc cancel",
-        Mode::ReviewSummary(_) => "Enter submit  Ctrl+Enter newline  Esc normal  Esc again cancel",
+        Mode::ReviewSummary(_) => "Enter submit  Alt+Enter newline  Esc normal  Esc again cancel",
         Mode::Comments => "j/k select  x remove  Esc or c close",
         Mode::Message(_) => "Enter or Esc close",
     };
@@ -2985,7 +2989,7 @@ fn draw_overlay(app: &App, frame: &mut ratatui::Frame, area: Rect) {
                     .block(
                         Block::default()
                             .title(format!(
-                                " Comment: {target} [{}]  Enter submit · Shift+Enter newline ",
+                                " Comment: {target} [{}]  Enter submit · Alt+Enter newline ",
                                 editor_status_label(&app.editor)
                             ))
                             .borders(Borders::ALL)
@@ -3241,15 +3245,23 @@ fn open_in_editor(app: &App, _workspace: &Path) -> Result<()> {
         .map(|(number, _)| number)
         .unwrap_or(1);
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
     let status = Command::new(editor)
         .current_dir(&root)
         .arg(format!("+{line}"))
         .arg(relative_path)
         .status();
-    execute!(io::stdout(), EnterAlternateScreen)?;
     enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let status = status.context("could not open editor")?;
     if !status.success() {
         bail!("editor exited with status {status}");
@@ -4515,7 +4527,11 @@ fn run_in_terminal(
         .context("could not load default syntax theme")?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let outcome: Result<()> = (|| {
         let mut selected = 0usize;
@@ -4559,7 +4575,11 @@ fn run_in_terminal(
             }
         }
     })();
-    let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let leave_result = execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
     let raw_mode_result = disable_raw_mode();
     outcome?;
     leave_result?;
@@ -4589,7 +4609,11 @@ fn run_local_review(
     };
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let outcome = review_local_changes(
         &mut terminal,
@@ -4601,7 +4625,11 @@ fn run_local_review(
         &syntax_set,
         &syntax_theme,
     );
-    let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let leave_result = execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
     let raw_mode_result = disable_raw_mode();
     outcome?;
     leave_result?;
@@ -4683,7 +4711,11 @@ fn run_local_pull_request_review(pr_number: String, review_id: String) -> Result
         .context("could not load default syntax theme")?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let outcome = review_pull_request(
         &mut terminal,
@@ -4698,7 +4730,11 @@ fn run_local_pull_request_review(pr_number: String, review_id: String) -> Result
             review_id,
         }),
     );
-    let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let leave_result = execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
     let raw_mode_result = disable_raw_mode();
     outcome?;
     leave_result?;
@@ -5928,13 +5964,15 @@ mod tests {
     }
 
     #[test]
-    fn input_editor_uses_shift_enter_for_a_newline() {
+    fn input_editor_uses_alt_enter_for_a_newline() {
         let mut editor = TextEditor::new();
         editor.handle(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(matches!(
-            editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             super::EditorAction::Continue
         ));
+        assert_eq!(editor.text, "a\n");
+        assert_eq!(editor_render_text(&editor).lines.len(), 2);
         editor.handle(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
 
         assert_eq!(editor.text, "a\nb");
@@ -6068,10 +6106,18 @@ mod tests {
     }
 
     #[test]
-    fn editor_overlay_expands_only_after_wrapping() {
+    fn editor_overlay_expands_for_blank_lines_and_wrapping() {
         let mut editor = TextEditor::new();
         let area = Rect::new(0, 0, 100, 40);
         assert_eq!(editor_overlay(area, &editor).height, 3);
+
+        editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(editor_overlay(area, &editor).height, 4);
+        assert_eq!(editor_render_text(&editor).lines.len(), 2);
+
+        editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(editor_overlay(area, &editor).height, 5);
+        assert_eq!(editor_render_text(&editor).lines.len(), 3);
 
         editor.text = "x".repeat(79);
         assert_eq!(editor_overlay(area, &editor).height, 4);

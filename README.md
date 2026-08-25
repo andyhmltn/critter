@@ -81,7 +81,7 @@ to always review the current branch pull request.
 | `j` / `k` | Move between files, change blocks, or lines |
 | `h` / `l` | Previous / next file |
 | `Enter` | Open or comment |
-| `Shift+Enter` | Insert a newline in a comment |
+| `Alt+Enter` | Insert a newline in a comment |
 | `V` | Select individual lines |
 | `/` | Search changed lines |
 | `n` / `N` | Next / previous search result |
