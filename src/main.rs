@@ -51,7 +51,7 @@ const CLI_COMMANDS: &[&str] = &[
     "reviewer local [--base REVISION | --unstaged | --last-commit] [--session SESSION_ID]",
     "reviewer local-tmux [--base REVISION | --unstaged | --last-commit] [--wait]",
     "reviewer pr-tmux [PR_NUMBER | --unstaged | --last-commit] [--wait]",
-    "reviewer codex-tmux [PR_NUMBER | --unstaged | --last-commit]",
+    "reviewer codex-tmux [PR_NUMBER | --unstaged | --last-commit | --unstaged-or-pr]",
     "reviewer peer-review --repo OWNER/NAME PR_NUMBER",
     "reviewer peer-review-status --repo OWNER/NAME PR_NUMBER",
 ];
@@ -3550,11 +3550,20 @@ fn active_tmux_pane() -> Result<String> {
     Ok(pane)
 }
 
-fn codex_tmux_args(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
+fn codex_tmux_args(args: &[String]) -> Result<(Option<String>, bool, Vec<String>)> {
     let mut target_pane = None;
+    let mut unstaged_or_pr = false;
     let mut review_args = Vec::new();
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--unstaged-or-pr" {
+            if unstaged_or_pr {
+                bail!("--unstaged-or-pr may only be supplied once");
+            }
+            unstaged_or_pr = true;
+            index += 1;
+            continue;
+        }
         if args[index] != "--target-pane" {
             review_args.push(args[index].clone());
             index += 1;
@@ -3572,18 +3581,30 @@ fn codex_tmux_args(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
         );
         index += 1;
     }
-    Ok((target_pane, review_args))
+    Ok((target_pane, unstaged_or_pr, review_args))
 }
 
 fn run_codex_tmux_review(args: &[String]) -> Result<()> {
     if std::env::var_os("TMUX").is_none() {
         bail!("reviewer codex-tmux must run inside tmux");
     }
-    let (target_pane, review_args) = codex_tmux_args(args)?;
+    let (target_pane, unstaged_or_pr, mut review_args) = codex_tmux_args(args)?;
     let pane = match target_pane {
         Some(pane) => pane,
         None => active_tmux_pane()?,
     };
+    if unstaged_or_pr {
+        if !review_args.is_empty() {
+            bail!("--unstaged-or-pr cannot be combined with another review scope");
+        }
+        let diff = git_at(
+            Path::new("."),
+            &["diff", "--no-color", "--no-ext-diff", "--find-renames"],
+        )?;
+        if !parse_diff(&diff).is_empty() {
+            review_args.push("--unstaged".to_string());
+        }
+    }
     let (pr_number, review_id, wait, local_scope) = pull_request_review_args(&review_args)?;
     if wait {
         bail!("--wait is not supported with reviewer codex-tmux");
@@ -6166,10 +6187,23 @@ mod tests {
         let args = ["--target-pane", "%42", "--unstaged"].map(str::to_string);
         assert_eq!(
             codex_tmux_args(&args).unwrap(),
-            (Some("%42".to_string()), vec!["--unstaged".to_string()])
+            (
+                Some("%42".to_string()),
+                false,
+                vec!["--unstaged".to_string()]
+            )
         );
 
         let missing = ["--target-pane"].map(str::to_string);
         assert!(codex_tmux_args(&missing).is_err());
+
+        let fallback = ["--unstaged-or-pr"].map(str::to_string);
+        assert_eq!(
+            codex_tmux_args(&fallback).unwrap(),
+            (None, true, Vec::new())
+        );
+
+        let duplicate = ["--unstaged-or-pr", "--unstaged-or-pr"].map(str::to_string);
+        assert!(codex_tmux_args(&duplicate).is_err());
     }
 }

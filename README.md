@@ -66,11 +66,13 @@ leaves the Codex chat untouched.
 # Review unstaged tracked changes with prefix + h.
 bind-key h set-environment -gF REVIEWER_CODEX_PANE '#{pane_id}' \; \
   new-window -n reviewer -c '#{pane_current_path}' \
-  '~/.cargo/bin/reviewer codex-tmux --target-pane "$REVIEWER_CODEX_PANE" --unstaged'
+  '~/.cargo/bin/reviewer codex-tmux --target-pane "$REVIEWER_CODEX_PANE" --unstaged-or-pr'
 ```
 
-Use `reviewer codex-tmux --last-commit` for the last commit, or omit the scope
-flag to review the current branch pull request.
+`--unstaged-or-pr` reviews unstaged tracked changes when there are any and falls
+back to the current branch pull request when the working tree is clean. Use
+`reviewer codex-tmux --last-commit` for the last commit, or omit the scope flag
+to always review the current branch pull request.
 
 ## ⌨️ Keys
 
