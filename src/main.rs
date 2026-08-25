@@ -1541,7 +1541,32 @@ fn parse_diff(diff: &str) -> Vec<ChangedFile> {
 }
 
 fn selected_comment_target(app: &App) -> Option<(u32, Side)> {
-    let line = app.files.get(app.file_index)?.lines.get(app.line_index)?;
+    let file = app.files.get(app.file_index)?;
+    comment_target(file, app.line_index, app.diff_navigation)
+}
+
+fn comment_target(
+    file: &ChangedFile,
+    line_index: usize,
+    navigation: DiffNavigation,
+) -> Option<(u32, Side)> {
+    if matches!(navigation, DiffNavigation::Block)
+        && let Some((start, end)) = change_block_at(file, line_index)
+    {
+        if let Some(number) = file.lines[start..=end]
+            .iter()
+            .find_map(|line| line.new_line.filter(|_| matches!(line.kind, LineKind::Add)))
+        {
+            return Some((number, Side::Right));
+        }
+        if let Some(number) = file.lines[start..=end].iter().find_map(|line| {
+            line.old_line
+                .filter(|_| matches!(line.kind, LineKind::Remove))
+        }) {
+            return Some((number, Side::Left));
+        }
+    }
+    let line = file.lines.get(line_index)?;
     if let Some(number) = line.new_line {
         return Some((number, Side::Right));
     }
@@ -2967,9 +2992,9 @@ fn draw_overlay(app: &App, frame: &mut ratatui::Frame, area: Rect) {
         }
         Mode::Submit => {
             let choices = if app.local_review.is_some() {
-                "Submit local review\n\n[s] Submit feedback to Codex\n[x] Copy comments and diff context\n\nEsc cancels"
+                "Submit local review\n\n[s] Submit feedback to Codex\n[x] Copy comments\n\nEsc cancels"
             } else {
-                "Submit review\n\n[a] Approve\n[r] Request changes\n[c] Comment\n[x] Copy comments and diff context\n\nEsc cancels"
+                "Submit review\n\n[a] Approve\n[r] Request changes\n[c] Comment\n[x] Copy comments\n\nEsc cancels"
             };
             frame.render_widget(Clear, overlay);
             frame.render_widget(
@@ -3481,8 +3506,8 @@ fn review_handoff(app: &App) -> String {
             .join("\n\n")
     };
     format!(
-        "# Pull request review handoff\n\nRepository: `{}`\nPull request: #{}\nTitle: {}\n\n## Pending comments\n\n{}\n\n## Diff context\n\n```diff\n{}\n```\n",
-        app.repo, app.pr_number, app.pull.title, comments, app.briefing_diff
+        "# Pull request review handoff\n\nRepository: `{}`\nPull request: #{}\nTitle: {}\n\n## Pending comments\n\n{}\n",
+        app.repo, app.pr_number, app.pull.title, comments
     )
 }
 
@@ -3939,9 +3964,8 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
                 } else {
                     match copy_to_clipboard(&review_handoff(app)) {
                         Ok(()) => {
-                            app.mode = Mode::Message(
-                                "Comments and diff context copied to the clipboard.".to_string(),
-                            );
+                            app.mode =
+                                Mode::Message("Comments copied to the clipboard.".to_string());
                         }
                         Err(error) => app.mode = Mode::Message(error.to_string()),
                     }
@@ -5086,8 +5110,8 @@ mod tests {
         App, Author, BriefingState, CLI_COMMANDS, Color, DiffNavigation, FlowPlan, FlowState,
         Focus, LineKind, ListState, Mode, PendingComment, PullRequest, ReviewProgress, Side,
         TextEditor, active_author_prefix, author_suggestions, change_block_at, cli_usage,
-        complete_author, editor_overlay, editor_render_text, editor_status_label, handle_browse,
-        handle_event, highlight_files, is_entirely_added_or_removed, line_matches,
+        comment_target, complete_author, editor_overlay, editor_render_text, editor_status_label,
+        handle_browse, handle_event, highlight_files, is_entirely_added_or_removed, line_matches,
         local_review_args, local_review_prompt, local_review_tmux_command, markdown_inline,
         parse_cli_args, parse_diff, replace_picker_results, report_sections, review_handoff,
         search, shell_single_quote, update_diff_scroll,
@@ -5243,6 +5267,27 @@ mod tests {
         assert_eq!(files[0].lines[4].old_line, None);
         assert_eq!(files[0].lines[4].new_line, Some(5));
         assert_eq!(files[0].lines[4].kind, LineKind::Add);
+    }
+
+    #[test]
+    fn block_comments_prefer_the_new_side_while_line_comments_use_the_selected_side() {
+        let files = parse_diff(
+            "diff --git a/src/main.rs b/src/main.rs\n@@ -4,2 +4,2 @@\n context\n-removed\n+added\n",
+        );
+        let file = &files[0];
+
+        assert_eq!(
+            comment_target(file, 2, DiffNavigation::Block),
+            Some((5, Side::Right))
+        );
+        assert_eq!(
+            comment_target(file, 2, DiffNavigation::Line),
+            Some((5, Side::Left))
+        );
+        assert_eq!(
+            comment_target(file, 3, DiffNavigation::Line),
+            Some((5, Side::Right))
+        );
     }
 
     #[test]
@@ -5615,7 +5660,7 @@ mod tests {
         assert!(handoff.contains("# Pull request review handoff"));
         assert!(handoff.contains("`two.rs` at `1` on `the new side`"));
         assert!(handoff.contains("pending"));
-        assert!(handoff.contains("diff --git a/two.rs b/two.rs"));
+        assert!(!handoff.contains("diff --git a/two.rs b/two.rs"));
 
         app.mode = Mode::Command;
         app.editor.reset();
