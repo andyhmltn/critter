@@ -3514,6 +3514,10 @@ fn inject_codex_prompt(pane: &str, prompt: &str) -> Result<()> {
     if !status.success() {
         bail!("tmux paste-buffer exited with status {status}");
     }
+
+    // Codex handles bracketed paste asynchronously. Give it time to finish
+    // committing the pasted block before sending the key that submits it.
+    std::thread::sleep(Duration::from_millis(250));
     let status = Command::new("tmux")
         .args(["send-keys", "-t", pane, "Enter"])
         .status()
