@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::write_atomic;
+
 #[derive(Default, Deserialize, Serialize)]
 struct ProgressFile {
     head_oid: String,
@@ -31,12 +33,11 @@ pub fn load_picker_query(repo: &str) -> Result<Option<String>> {
 
 pub fn save_picker_query(repo: &str, query: &str) -> Result<()> {
     let path = picker_search_path(repo);
-    let parent = path.parent().context("picker search path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
     let contents = serde_json::to_vec_pretty(&PickerSearchFile {
         query: query.to_string(),
     })?;
-    fs::write(&path, contents).with_context(|| format!("could not save {}", path.display()))
+    // Keep the previous valid query if Reviewer is interrupted while updating the cache.
+    write_atomic(&path, &contents).with_context(|| format!("could not save {}", path.display()))
 }
 
 pub struct ReviewProgress {
@@ -84,15 +85,12 @@ impl ReviewProgress {
     }
 
     fn save(&self) -> Result<()> {
-        let parent = self.path.parent().context("progress path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
         let progress = ProgressFile {
             head_oid: self.head_oid.clone(),
             viewed_files: self.viewed_files.clone(),
         };
         let contents = serde_json::to_vec_pretty(&progress)?;
-        fs::write(&self.path, contents)
+        write_atomic(&self.path, &contents)
             .with_context(|| format!("could not save {}", self.path.display()))
     }
 }

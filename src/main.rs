@@ -26,6 +26,7 @@ use vimltui::{
 };
 
 mod briefing;
+mod cache;
 mod flow;
 mod progress;
 
@@ -50,6 +51,7 @@ const CLI_COMMANDS: &[&str] = &[
     "reviewer local [--base REVISION | --unstaged | --last-commit] [--session SESSION_ID]",
     "reviewer local-tmux [--base REVISION | --unstaged | --last-commit] [--wait]",
     "reviewer pr-tmux [PR_NUMBER | --unstaged | --last-commit] [--wait]",
+    "reviewer codex-tmux [PR_NUMBER | --unstaged | --last-commit]",
     "reviewer peer-review --repo OWNER/NAME PR_NUMBER",
     "reviewer peer-review-status --repo OWNER/NAME PR_NUMBER",
 ];
@@ -3482,6 +3484,123 @@ fn print_local_review_prompt_when_submitted(review_id: &str) -> Result<()> {
     }
 }
 
+fn inject_codex_prompt(pane: &str, prompt: &str) -> Result<()> {
+    let buffer = format!("reviewer-codex-{}", std::process::id());
+    let mut child = Command::new("tmux")
+        .args(["load-buffer", "-b", &buffer, "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("could not create a tmux buffer for the Codex handoff")?;
+    child
+        .stdin
+        .as_mut()
+        .context("could not open the tmux buffer input")?
+        .write_all(prompt.as_bytes())?;
+    let status = child
+        .wait()
+        .context("could not finish writing the Codex handoff")?;
+    if !status.success() {
+        bail!("tmux load-buffer exited with status {status}");
+    }
+
+    let status = Command::new("tmux")
+        .args(["paste-buffer", "-p", "-d", "-b", &buffer, "-t", pane])
+        .status()
+        .context("could not paste the review into the Codex pane")?;
+    if !status.success() {
+        bail!("tmux paste-buffer exited with status {status}");
+    }
+    let status = Command::new("tmux")
+        .args(["send-keys", "-t", pane, "Enter"])
+        .status()
+        .context("could not submit the review to Codex")?;
+    if !status.success() {
+        bail!("tmux send-keys exited with status {status}");
+    }
+    Ok(())
+}
+
+fn active_tmux_pane() -> Result<String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{pane_id}"])
+        .output()
+        .context("could not determine the active tmux pane")?;
+    if !output.status.success() {
+        bail!(
+            "tmux display-message exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let pane = String::from_utf8(output.stdout)
+        .context("tmux returned a non-UTF-8 pane ID")?
+        .trim()
+        .to_string();
+    if pane.is_empty() {
+        bail!("tmux returned an empty pane ID");
+    }
+    Ok(pane)
+}
+
+fn codex_tmux_args(args: &[String]) -> Result<(Option<String>, Vec<String>)> {
+    let mut target_pane = None;
+    let mut review_args = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != "--target-pane" {
+            review_args.push(args[index].clone());
+            index += 1;
+            continue;
+        }
+        if target_pane.is_some() {
+            bail!("--target-pane may only be supplied once");
+        }
+        index += 1;
+        target_pane = Some(
+            args.get(index)
+                .filter(|value| !value.is_empty())
+                .context("--target-pane requires a value")?
+                .clone(),
+        );
+        index += 1;
+    }
+    Ok((target_pane, review_args))
+}
+
+fn run_codex_tmux_review(args: &[String]) -> Result<()> {
+    if std::env::var_os("TMUX").is_none() {
+        bail!("reviewer codex-tmux must run inside tmux");
+    }
+    let (target_pane, review_args) = codex_tmux_args(args)?;
+    let pane = match target_pane {
+        Some(pane) => pane,
+        None => active_tmux_pane()?,
+    };
+    let (pr_number, review_id, wait, local_scope) = pull_request_review_args(&review_args)?;
+    if wait {
+        bail!("--wait is not supported with reviewer codex-tmux");
+    }
+    if review_id.is_some() {
+        bail!("--review-id is not supported with reviewer codex-tmux");
+    }
+    let review_id = new_local_review_id(&None);
+    if let Some(scope) = local_scope {
+        run_local_review("HEAD".to_string(), scope, None, Some(review_id.clone()))?;
+    } else {
+        let pr_number = match pr_number {
+            Some(pr_number) => pr_number,
+            None => current_pull_request_number()?,
+        };
+        run_local_pull_request_review(pr_number, review_id.clone())?;
+    }
+
+    if !local_review_path(&review_id).exists() {
+        return Ok(());
+    }
+    let submission = load_local_review(&review_id)?;
+    inject_codex_prompt(&pane, &local_review_prompt(&submission))
+}
+
 fn review_handoff(app: &App) -> String {
     let comments = if app.comments.is_empty() {
         "No pending inline comments.".to_string()
@@ -5053,6 +5172,7 @@ fn main() -> Result<()> {
                 let review_id = review_id.unwrap_or_else(|| new_local_review_id(&None));
                 return open_pull_request_review_in_tmux(pr_number, review_id, wait);
             }
+            "codex-tmux" => return run_codex_tmux_review(&args[1..]),
             "pr-local" => {
                 let (pr_number, review_id, wait, local_scope) =
                     pull_request_review_args(&args[1..])?;
@@ -5110,11 +5230,12 @@ mod tests {
         App, Author, BriefingState, CLI_COMMANDS, Color, DiffNavigation, FlowPlan, FlowState,
         Focus, LineKind, ListState, Mode, PendingComment, PullRequest, ReviewProgress, Side,
         TextEditor, active_author_prefix, author_suggestions, change_block_at, cli_usage,
-        comment_target, complete_author, editor_overlay, editor_render_text, editor_status_label,
-        handle_browse, handle_event, highlight_files, is_entirely_added_or_removed, line_matches,
-        local_review_args, local_review_prompt, local_review_tmux_command, markdown_inline,
-        parse_cli_args, parse_diff, replace_picker_results, report_sections, review_handoff,
-        search, shell_single_quote, update_diff_scroll,
+        codex_tmux_args, comment_target, complete_author, editor_overlay, editor_render_text,
+        editor_status_label, handle_browse, handle_event, highlight_files,
+        is_entirely_added_or_removed, line_matches, local_review_args, local_review_prompt,
+        local_review_tmux_command, markdown_inline, parse_cli_args, parse_diff,
+        replace_picker_results, report_sections, review_handoff, search, shell_single_quote,
+        update_diff_scroll,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -6013,5 +6134,17 @@ mod tests {
 
         let conflicting = ["--unstaged", "--last-commit"].map(str::to_string);
         assert!(super::pull_request_review_args(&conflicting).is_err());
+    }
+
+    #[test]
+    fn separates_codex_target_pane_from_review_options() {
+        let args = ["--target-pane", "%42", "--unstaged"].map(str::to_string);
+        assert_eq!(
+            codex_tmux_args(&args).unwrap(),
+            (Some("%42".to_string()), vec!["--unstaged".to_string()])
+        );
+
+        let missing = ["--target-pane"].map(str::to_string);
+        assert!(codex_tmux_args(&missing).is_err());
     }
 }

@@ -55,6 +55,20 @@ reviewer local-tmux --wait --base main
 
 The bundled Codex plugin exposes the same flow as `$local-review`.
 
+To start a review without spending a Codex turn on the plugin, add a tmux popup
+binding. When you submit the review, Critter pastes the complete feedback into
+the originating Codex chat and presses Enter. Quitting without submitting does
+nothing.
+
+```tmux
+# Review unstaged tracked changes with prefix + R.
+bind-key R display-popup -E -w 90% -h 90% \
+  'reviewer codex-tmux --unstaged'
+```
+
+Use `reviewer codex-tmux --last-commit` for the last commit, or omit the scope
+flag to review the current branch pull request.
+
 ## ⌨️ Keys
 
 | Key | Action |

@@ -7,6 +7,8 @@ use std::sync::mpsc::Sender;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::write_atomic;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FlowPlan {
     pub steps: Vec<FlowStep>,
@@ -211,9 +213,7 @@ fn parse_flow_plan(response: &str) -> Result<FlowPlan> {
 
 pub fn save_plan(repo: &str, pr: &str, head: &str, plan: &FlowPlan) -> Result<()> {
     let path = cache_path(repo, pr, head);
-    let parent = path.parent().context("flow cache path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
-    fs::write(&path, serde_json::to_vec_pretty(plan)?)
+    write_atomic(&path, &serde_json::to_vec_pretty(plan)?)
         .with_context(|| format!("could not save {}", path.display()))
 }
 
