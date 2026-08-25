@@ -599,8 +599,12 @@ impl TextEditor {
             self.pending_visual_inner = false;
         }
         if matches!(self.mode, EditorMode::Insert) && matches!(key.code, KeyCode::Enter) {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                key.modifiers.remove(KeyModifiers::CONTROL);
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL)
+            {
+                key.modifiers
+                    .remove(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
             } else {
                 return EditorAction::Submit;
             }
@@ -2981,7 +2985,7 @@ fn draw_overlay(app: &App, frame: &mut ratatui::Frame, area: Rect) {
                     .block(
                         Block::default()
                             .title(format!(
-                                " Comment: {target} [{}] ",
+                                " Comment: {target} [{}]  Enter submit · Shift+Enter newline ",
                                 editor_status_label(&app.editor)
                             ))
                             .borders(Borders::ALL)
@@ -5896,6 +5900,23 @@ mod tests {
         editor.handle(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
 
         assert_eq!(editor.text, "azc");
+    }
+
+    #[test]
+    fn input_editor_uses_shift_enter_for_a_newline() {
+        let mut editor = TextEditor::new();
+        editor.handle(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(
+            editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            super::EditorAction::Continue
+        ));
+        editor.handle(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        assert_eq!(editor.text, "a\nb");
+        assert!(matches!(
+            editor.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            super::EditorAction::Submit
+        ));
     }
 
     #[test]

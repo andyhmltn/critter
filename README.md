@@ -55,15 +55,18 @@ reviewer local-tmux --wait --base main
 
 The bundled Codex plugin exposes the same flow as `$local-review`.
 
-To start a review without spending a Codex turn on the plugin, add a tmux popup
-binding. When you submit the review, Critter pastes the complete feedback into
-the originating Codex chat and presses Enter. Quitting without submitting does
-nothing.
+To start a review without spending a Codex turn on the plugin, add a tmux
+binding that opens Critter in its own window. The binding captures the
+originating pane before opening the review so Critter knows which Codex chat
+should receive the result. When you submit, the review window closes and the
+complete feedback is pasted into that chat and sent. Quitting without submitting
+leaves the Codex chat untouched.
 
 ```tmux
-# Review unstaged tracked changes with prefix + R.
-bind-key R display-popup -E -w 90% -h 90% \
-  'reviewer codex-tmux --unstaged'
+# Review unstaged tracked changes with prefix + h.
+bind-key h set-environment -gF REVIEWER_CODEX_PANE '#{pane_id}' \; \
+  new-window -n reviewer -c '#{pane_current_path}' \
+  '~/.cargo/bin/reviewer codex-tmux --target-pane "$REVIEWER_CODEX_PANE" --unstaged'
 ```
 
 Use `reviewer codex-tmux --last-commit` for the last commit, or omit the scope
@@ -76,6 +79,7 @@ flag to review the current branch pull request.
 | `j` / `k` | Move between files, change blocks, or lines |
 | `h` / `l` | Previous / next file |
 | `Enter` | Open or comment |
+| `Shift+Enter` | Insert a newline in a comment |
 | `V` | Select individual lines |
 | `/` | Search changed lines |
 | `n` / `N` | Next / previous search result |
