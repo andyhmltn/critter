@@ -59,12 +59,19 @@ pub fn analyze_symbols(diff: &str) -> Vec<SymbolChange> {
 }
 
 fn symbol_name(line: &str) -> Option<String> {
-    let line = line.trim_start();
-    let line = line
-        .strip_prefix("pub ")
-        .or_else(|| line.strip_prefix("export "))
-        .or_else(|| line.strip_prefix("async "))
-        .unwrap_or(line);
+    let mut line = line.trim_start();
+    if let Some(rest) = line.strip_prefix("pub(")
+        && let Some((_, rest)) = rest.split_once(") ")
+    {
+        line = rest;
+    } else if let Some(rest) = line.strip_prefix("pub ") {
+        line = rest;
+    } else if let Some(rest) = line.strip_prefix("export ") {
+        line = rest;
+    }
+    if let Some(rest) = line.strip_prefix("async ") {
+        line = rest;
+    }
     for prefix in [
         "fn ",
         "function ",
@@ -317,6 +324,24 @@ mod tests {
             changes
                 .iter()
                 .any(|s| s.name == "old_helper" && s.kind == "removed")
+        );
+    }
+
+    #[test]
+    fn detects_rust_functions_with_visibility_and_async_modifiers() {
+        let changes = analyze_symbols(
+            "+++ b/src/api.rs\n+pub(crate) fn parse_request() {}\n+pub async fn fetch_user() {}\n",
+        );
+
+        assert!(
+            changes
+                .iter()
+                .any(|symbol| symbol.name == "parse_request" && symbol.kind == "added")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|symbol| symbol.name == "fetch_user" && symbol.kind == "added")
         );
     }
 
