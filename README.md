@@ -11,10 +11,44 @@ Critter brings GitHub's familiar review flow to a fast, keyboard-driven TUI: rea
 You need [Rust](https://www.rust-lang.org/tools/install), the [GitHub CLI](https://cli.github.com/), and an authenticated GitHub session (`gh auth login`).
 
 ```sh
-cargo install --git https://github.com/andyhmltn/reviewer
+cargo install --git https://github.com/andyhmltn/critter --locked
 ```
 
 Critter uses `nvim` to open files by default. Set `$EDITOR` to use something else.
+
+### Releases and distro packaging
+
+Versioned sources are available on the [releases page](https://github.com/andyhmltn/critter/releases).
+Tags use `v<version>` (for example, `v0.1.0`) and match the version in `Cargo.toml`.
+To build a downloaded release for packaging:
+
+```sh
+cargo build --release --locked
+install -Dm755 target/release/reviewer "$pkgdir/usr/bin/reviewer"
+install -Dm644 LICENSE.md "$pkgdir/usr/share/licenses/critter/LICENSE.md"
+```
+
+Here, `$pkgdir` is the package staging directory used by Arch's `PKGBUILD`.
+The executable is named `reviewer`. Rust is a build dependency; the GitHub CLI
+(`gh`) is needed for GitHub operations. The tmux integration also needs `tmux`.
+
+### Publishing a release
+
+Update the version in `Cargo.toml` and refresh `Cargo.lock` with `cargo check`.
+Commit and push those changes along with the release workflow, then create and
+push an annotated tag matching the package version:
+
+```sh
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Use the new version in both commands for subsequent releases. The release
+workflow checks the tag against `Cargo.toml`, runs the tests and release build
+with the lockfile, and publishes a GitHub release with generated notes and
+GitHub's source archives. Versions with a prerelease suffix (such as
+`v0.2.0-rc.1`) are marked as prereleases. Published tags should not be moved;
+create a new version for fixes.
 
 ## 🔍 Review a pull request
 
