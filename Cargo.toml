@@ -9,6 +9,7 @@ name = "reviewer"
 path = "src/main.rs"
 
 [dependencies]
+ansi-to-tui = "8.0"
 anyhow = "1.0"
 crossterm = "0.29"
 ratatui = "0.30"

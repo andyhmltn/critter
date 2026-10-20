@@ -39,6 +39,31 @@ use progress::{ReviewProgress, load_picker_query, save_picker_query};
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+fn render_markdown(body: &str) -> Text<'static> {
+    use ansi_to_tui::IntoText;
+    let mut child = match Command::new("glow")
+        .args(["-s", "dark", "-w", "120", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Text::from(body.to_string()),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(body.as_bytes());
+    }
+    let output = match child.wait_with_output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Text::from(body.to_string()),
+    };
+    output
+        .stdout
+        .into_text()
+        .unwrap_or_else(|_| Text::from(body.to_string()))
+}
+
 const ACCENT: Color = Color::Cyan;
 const ADDED: Color = Color::Green;
 const ADDED_BACKGROUND: Color = Color::Rgb(34, 48, 34);
@@ -671,6 +696,9 @@ struct App {
     sidebar_visible: bool,
     description_expanded: bool,
     description_scroll: u16,
+    description_text: Text<'static>,
+    description_cached_body: String,
+    description_fullscreen: bool,
     diff_scroll: usize,
     diff_view_height: usize,
     center_diff: bool,
@@ -1831,6 +1859,35 @@ fn search(app: &mut App, forward: bool) -> bool {
     false
 }
 
+fn search_description(app: &mut App, forward: bool) -> bool {
+    if app.search_query.is_empty() {
+        return false;
+    }
+    let query = app.search_query.to_lowercase();
+    let total = app.description_text.lines.len();
+    if total == 0 {
+        return false;
+    }
+    let start = (app.description_scroll as usize).min(total.saturating_sub(1));
+    for offset in 1..=total {
+        let idx = if forward {
+            (start + offset) % total
+        } else {
+            (start + total - offset) % total
+        };
+        let line_text: String = app.description_text.lines[idx]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        if line_text.to_lowercase().contains(&query) {
+            app.description_scroll = idx as u16;
+            return true;
+        }
+    }
+    false
+}
+
 fn line_matches(line: &DiffLine, query: &str) -> bool {
     line.text.to_lowercase().contains(query)
 }
@@ -2182,6 +2239,34 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     ]))
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, layout[0]);
+    if app.description_fullscreen && matches!(app.focus, Focus::Description) {
+        if app.description_cached_body != app.pull.body {
+            app.description_text = if app.pull.body.trim().is_empty() {
+                Text::from("No description provided.")
+            } else {
+                render_markdown(&app.pull.body)
+            };
+            app.description_cached_body = app.pull.body.clone();
+        }
+        frame.render_widget(
+            Paragraph::new(app.description_text.clone())
+                .block(
+                    Block::default()
+                        .title(" Description [fullscreen] ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT)),
+                )
+                .scroll((app.description_scroll, 0))
+                .wrap(Wrap { trim: false }),
+            layout[1],
+        );
+        let hint = Paragraph::new(Line::from(vec![Span::styled(
+            " j/k scroll · gg/G jump · C-d/C-u half-page · z/Esc exit ",
+            Style::default().fg(MUTED),
+        )]));
+        frame.render_widget(hint, layout[2]);
+        return;
+    }
     let diff_area = if app.sidebar_visible {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -2196,13 +2281,16 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(description_height), Constraint::Min(3)])
             .split(columns[1]);
-        let description = if app.pull.body.trim().is_empty() {
-            "No description provided."
-        } else {
-            app.pull.body.as_str()
-        };
+        if app.description_cached_body != app.pull.body {
+            app.description_text = if app.pull.body.trim().is_empty() {
+                Text::from("No description provided.")
+            } else {
+                render_markdown(&app.pull.body)
+            };
+            app.description_cached_body = app.pull.body.clone();
+        }
         frame.render_widget(
-            Paragraph::new(description)
+            Paragraph::new(app.description_text.clone())
                 .block(
                     Block::default()
                         .title(if app.description_expanded {
@@ -3849,6 +3937,60 @@ fn handle_browse(app: &mut App, key: KeyEvent, workspace: &Path) {
         app.pending_z = true;
         return;
     }
+    if matches!(app.focus, Focus::Description) && app.description_fullscreen {
+        match key.code {
+            KeyCode::Char('z') | KeyCode::Esc | KeyCode::Char('q') => {
+                app.description_fullscreen = false;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.description_scroll = app.description_scroll.saturating_add(1);
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.description_scroll = app.description_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.description_scroll = app.description_scroll.saturating_add(10);
+                return;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.description_scroll = app.description_scroll.saturating_sub(10);
+                return;
+            }
+            KeyCode::Char('g') => {
+                app.description_scroll = 0;
+                return;
+            }
+            KeyCode::Char('G') => {
+                app.description_scroll = u16::MAX;
+                return;
+            }
+            KeyCode::Char('/') => {
+                app.editor.reset();
+                app.mode = Mode::Search {
+                    previous_query: app.search_query.clone(),
+                };
+                return;
+            }
+            KeyCode::Char('n') if !app.search_query.is_empty() => {
+                search_description(app, true);
+                return;
+            }
+            KeyCode::Char('N') if !app.search_query.is_empty() => {
+                search_description(app, false);
+                return;
+            }
+            _ => return,
+        }
+    }
+    if matches!(app.focus, Focus::Description) && matches!(key.code, KeyCode::Char('z')) {
+        app.description_fullscreen = true;
+        app.description_expanded = true;
+        app.description_scroll = 0;
+        return;
+    }
     match key.code {
         KeyCode::Char('q') => request_quit(app),
         KeyCode::Char('b') => {
@@ -4081,7 +4223,11 @@ fn handle_event(app: &mut App, key: KeyEvent, workspace: &Path) {
             EditorAction::Submit => {
                 app.search_query = app.editor.text.trim().to_string();
                 app.mode = Mode::Browse;
-                search(app, true);
+                if app.description_fullscreen && matches!(app.focus, Focus::Description) {
+                    search_description(app, true);
+                } else {
+                    search(app, true);
+                }
             }
             EditorAction::Continue => {}
         },
@@ -4262,6 +4408,9 @@ fn review_pull_request(
         sidebar_visible: true,
         description_expanded: false,
         description_scroll: 0,
+        description_text: Text::default(),
+        description_cached_body: String::new(),
+        description_fullscreen: false,
         diff_scroll: 0,
         diff_view_height: 0,
         center_diff: true,
@@ -4412,6 +4561,9 @@ fn review_local_changes(
         sidebar_visible: true,
         description_expanded: false,
         description_scroll: 0,
+        description_text: Text::default(),
+        description_cached_body: String::new(),
+        description_fullscreen: false,
         diff_scroll: 0,
         diff_view_height: 0,
         center_diff: true,
@@ -5304,6 +5456,7 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use ratatui::text::Text;
     use std::path::Path;
     use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
@@ -5581,6 +5734,9 @@ mod tests {
             sidebar_visible: true,
             description_expanded: false,
             description_scroll: 0,
+            description_text: Text::default(),
+            description_cached_body: String::new(),
+            description_fullscreen: false,
             diff_scroll: 0,
             diff_view_height: 0,
             center_diff: true,
