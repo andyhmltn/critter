@@ -39,6 +39,14 @@ use progress::{ReviewProgress, load_picker_query, save_picker_query};
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+fn build_description_text(body: &str) -> Text<'static> {
+    if body.trim().is_empty() {
+        Text::from("No description provided.")
+    } else {
+        render_markdown(body)
+    }
+}
+
 fn render_markdown(body: &str) -> Text<'static> {
     use ansi_to_tui::IntoText;
     let mut child = match Command::new("glow")
@@ -2241,11 +2249,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     frame.render_widget(header, layout[0]);
     if app.description_fullscreen && matches!(app.focus, Focus::Description) {
         if app.description_cached_body != app.pull.body {
-            app.description_text = if app.pull.body.trim().is_empty() {
-                Text::from("No description provided.")
-            } else {
-                render_markdown(&app.pull.body)
-            };
+            app.description_text = build_description_text(&app.pull.body);
             app.description_cached_body = app.pull.body.clone();
         }
         frame.render_widget(
@@ -2282,11 +2286,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
             .constraints([Constraint::Length(description_height), Constraint::Min(3)])
             .split(columns[1]);
         if app.description_cached_body != app.pull.body {
-            app.description_text = if app.pull.body.trim().is_empty() {
-                Text::from("No description provided.")
-            } else {
-                render_markdown(&app.pull.body)
-            };
+            app.description_text = build_description_text(&app.pull.body);
             app.description_cached_body = app.pull.body.clone();
         }
         frame.render_widget(
@@ -4389,6 +4389,8 @@ fn review_pull_request(
     let report_sections = report_sections(&files, &diff);
     let flow_state = load_flow_analysis(&repo, &pr_number, &pull.head_ref_oid);
     let flow_view = matches!(&flow_state, FlowState::Ready(_));
+    let description_text = build_description_text(&pull.body);
+    let description_cached_body = pull.body.clone();
     let mut app = App {
         pr_number,
         repo,
@@ -4408,8 +4410,8 @@ fn review_pull_request(
         sidebar_visible: true,
         description_expanded: false,
         description_scroll: 0,
-        description_text: Text::default(),
-        description_cached_body: String::new(),
+        description_text,
+        description_cached_body,
         description_fullscreen: false,
         diff_scroll: 0,
         diff_view_height: 0,
@@ -4542,6 +4544,8 @@ fn review_local_changes(
     let report_sections = report_sections(&files, &diff);
     let flow_state = load_flow_analysis(&repo, &review_id, &head_oid);
     let flow_view = matches!(&flow_state, FlowState::Ready(_));
+    let description_text = build_description_text(&pull.body);
+    let description_cached_body = pull.body.clone();
     let mut app = App {
         pr_number: review_id.clone(),
         repo,
@@ -4561,8 +4565,8 @@ fn review_local_changes(
         sidebar_visible: true,
         description_expanded: false,
         description_scroll: 0,
-        description_text: Text::default(),
-        description_cached_body: String::new(),
+        description_text,
+        description_cached_body,
         description_fullscreen: false,
         diff_scroll: 0,
         diff_view_height: 0,
