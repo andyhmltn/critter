@@ -51,6 +51,10 @@ fn render_markdown(body: &str) -> Text<'static> {
     use ansi_to_tui::IntoText;
     let mut child = match Command::new("glow")
         .args(["-s", "dark", "-w", "120", "-"])
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env("CLICOLOR_FORCE", "1")
+        .env("CI", "true")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -60,10 +64,17 @@ fn render_markdown(body: &str) -> Text<'static> {
         Err(_) => return Text::from(body.to_string()),
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(body.as_bytes());
+        let body_bytes = body.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&body_bytes);
+        });
     }
-    let output = match child.wait_with_output() {
-        Ok(o) if o.status.success() => o,
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    let output = match receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(o)) if o.status.success() => o,
         _ => return Text::from(body.to_string()),
     };
     output
@@ -2139,29 +2150,44 @@ fn syntax_for_path<'a>(syntax_set: &'a SyntaxSet, path: &str) -> &'a SyntaxRefer
 }
 
 fn highlight_files(files: &mut [ChangedFile], syntax_set: &SyntaxSet, syntax_theme: &Theme) {
+    let shared_syntax_set = std::sync::Arc::new(syntax_set.clone());
+    let shared_theme = std::sync::Arc::new(syntax_theme.clone());
     for file in files {
-        let syntax = syntax_for_path(syntax_set, &file.path);
-        let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-        file.syntax_lines = file
-            .lines
-            .iter()
-            .map(|line| {
-                let source = format!("{}\n", line.text);
-                match highlighter.highlight_line(&source, syntax_set) {
-                    Ok(ranges) => ranges
-                        .into_iter()
-                        .filter_map(|(style, text)| {
-                            let text = text.trim_end_matches(['\r', '\n']);
-                            (!text.is_empty()).then(|| CodeSpan {
-                                text: text.to_string(),
-                                color: syntax_color(style.foreground),
+        let syntax_name = syntax_for_path(syntax_set, &file.path).name.clone();
+        let lines: Vec<String> = file.lines.iter().map(|line| line.text.clone()).collect();
+        let syntax_set_for_thread = std::sync::Arc::clone(&shared_syntax_set);
+        let theme_for_thread = std::sync::Arc::clone(&shared_theme);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let syntax = syntax_set_for_thread
+                .find_syntax_by_name(&syntax_name)
+                .unwrap_or_else(|| syntax_set_for_thread.find_syntax_plain_text());
+            let mut highlighter = HighlightLines::new(syntax, &theme_for_thread);
+            let result: Vec<Vec<CodeSpan>> = lines
+                .iter()
+                .map(|line| {
+                    let source = format!("{line}\n");
+                    match highlighter.highlight_line(&source, &syntax_set_for_thread) {
+                        Ok(ranges) => ranges
+                            .into_iter()
+                            .filter_map(|(style, text)| {
+                                let text = text.trim_end_matches(['\r', '\n']);
+                                (!text.is_empty()).then(|| CodeSpan {
+                                    text: text.to_string(),
+                                    color: syntax_color(style.foreground),
+                                })
                             })
-                        })
-                        .collect(),
-                    Err(_) => Vec::new(),
-                }
-            })
-            .collect();
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                })
+                .collect();
+            let _ = sender.send(result);
+        });
+        file.syntax_lines = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(highlighted) => highlighted,
+            Err(_) => vec![Vec::new(); file.lines.len()],
+        };
     }
 }
 
